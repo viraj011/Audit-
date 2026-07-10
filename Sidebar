@@ -1,0 +1,6 @@
+//  Also add it to $ADMIN_NAV if it appears there.
+// ============================================================
+
+// ── In your $NAV array, replace the two separate items with: ──
+
+$NAV = [
