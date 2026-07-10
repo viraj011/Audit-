@@ -1,0 +1,51 @@
+<?php
+// ============================================================
+//  PATCH FILE: config/db.php
+//  ADD this migration block inside qats_auto_migrate()
+//  after the existing nc_followups migration block.
+//  The function already runs on every db() call — safe to add.
+// ============================================================
+
+// ── Place this block INSIDE qats_auto_migrate(), after the
+//    existing nc_followups table creation / column checks ──
+
+$ncMigrations = [
+
+    // RCA fields (merged from rca_entries)
+    "ALTER TABLE `nc_followups` ADD COLUMN `root_cause`        TEXT         NULL AFTER `finding`",
+    "ALTER TABLE `nc_followups` ADD COLUMN `corrective_action` TEXT         NULL AFTER `root_cause`",
+    "ALTER TABLE `nc_followups` ADD COLUMN `responsible`       VARCHAR(120) NULL AFTER `corrective_action`",
+    "ALTER TABLE `nc_followups` ADD COLUMN `rca_notes`         TEXT         NULL AFTER `responsible`",
+
+    // Status upgrade: old values were pending/submitted/verified/rejected/closed
+    // New values add 'in_progress'. ALTER ENUM to add it safely:
+    "ALTER TABLE `nc_followups` MODIFY COLUMN `status`
+        ENUM('pending','in_progress','submitted','verified','rejected','closed')
+        NOT NULL DEFAULT 'pending'",
+
+    // Dates & evidence (may already exist — wrapped in IF NOT EXISTS via try/catch)
+    "ALTER TABLE `nc_followups` ADD COLUMN `completion_date`   DATE         NULL AFTER `due_date`",
+    "ALTER TABLE `nc_followups` ADD COLUMN `rejection_reason`  TEXT         NULL AFTER `completion_date`",
+    "ALTER TABLE `nc_followups` ADD COLUMN `evidence_path`     VARCHAR(500) NULL AFTER `rejection_reason`",
+    "ALTER TABLE `nc_followups` ADD COLUMN `evidence_name`     VARCHAR(255) NULL AFTER `evidence_path`",
+
+    // Who submitted / verified
+    "ALTER TABLE `nc_followups` ADD COLUMN `submitted_by`      VARCHAR(60)  NULL AFTER `evidence_name`",
+    "ALTER TABLE `nc_followups` ADD COLUMN `submitted_at`      DATETIME     NULL AFTER `submitted_by`",
+    "ALTER TABLE `nc_followups` ADD COLUMN `verified_by`       VARCHAR(60)  NULL AFTER `submitted_at`",
+    "ALTER TABLE `nc_followups` ADD COLUMN `verified_at`       DATETIME     NULL AFTER `verified_by`",
+
+    // Period type kept for any legacy RCA queries
+    "ALTER TABLE `nc_followups` ADD COLUMN `period_type`       VARCHAR(20)  NULL AFTER `verified_at`",
+
+    // Index for fast dept + status lookups
+    "CREATE INDEX `idx_ncf_dept_status`   ON `nc_followups` (`department`, `status`)",
+    "CREATE INDEX `idx_ncf_audit_id`      ON `nc_followups` (`audit_id`)",
+    "CREATE INDEX `idx_ncf_audit_code`    ON `nc_followups` (`audit_code`)",
+];
+
+foreach ($ncMigrations as $sql) {
+    try { $db->exec($sql); } catch (PDOException $e) { /* column/index already exists — skip */ }
+}
+
+// ── End of migration patch ──
