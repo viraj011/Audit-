@@ -1,0 +1,127 @@
+QATS Follow-up & RCA Merge — Installation Guide
+
+## Files Delivered
+
+| File | Action |
+|---|---|
+| `followup.php` | **Copy to** `C:\xampp\htdocs\qats\followup.php` |
+| `nc_followup.php` | **Copy to** `qats\nc_followup.php` (replaces old file) |
+| `rca.php` | **Copy to** `qats\rca.php` (replaces old file) |
+| `db_migration_patch.php` | Apply the SQL block inside `config/db.php` |
+| `audit_functions_patch.php` | Apply the function to `includes/audit_functions.php` |
+| `auth_patch.php` | Apply the redirect logic to `includes/auth.php` |
+| `sidebar_patch.php` | Merge nav entries in `includes/_sidebar.php` |
+
+---
+
+## Step 1 — Database Migration
+
+Open `config/db.php` and find the `qats_auto_migrate()` function.
+
+Inside it, after the existing `nc_followups` migration block, paste the
+entire contents of `db_migration_patch.php` (the `$ncMigrations` array
+and the `foreach` loop).
+
+The migration runs automatically on the next page load. It:
+- Adds `root_cause`, `corrective_action`, `responsible`, `rca_notes` columns
+- Adds `completion_date`, `rejection_reason`, `evidence_path`, `evidence_name`
+- Adds `submitted_by`, `submitted_at`, `verified_by`, `verified_at`
+- Expands the `status` ENUM to include `in_progress`
+- Creates indexes for fast dept+status lookups
+
+All `ALTER TABLE` statements use `try/catch` — existing columns are silently skipped.
+
+---
+
+## Step 2 — Update `save_audit()`
+
+In `includes/audit_functions.php`:
+
+1. Add the `_create_nc_followups()` function from `audit_functions_patch.php`.
+2. At the **end** of `save_audit()`, after `$db->commit()`, call:
+   ```php
+   _create_nc_followups($db, $audit, $results, (string)$audit_id, $audit_code);
+   ```
+3. Remove the old inline NC-creation loop (if any) from inside `save_audit()`.
+
+---
+
+## Step 3 — Update Login Redirect
+
+In `includes/auth.php`, find the `login()` success block where it does
+`header('Location: dashboard.php'); exit;`
+
+Replace it with a call to `_post_login_redirect($user)` using the logic
+from `auth_patch.php`. The rules are:
+
+- PQC / Admin / QA role → `dashboard.php`
+- All other departments → `followup.php`
+
+Also add `requireDashboardAccess()` at the top of `dashboard.php` to
+bounce non-PQC users who navigate there directly.
+
+---
+
+## Step 4 — Update Sidebar Nav
+
+In `includes/_sidebar.php`, find the two nav array entries for
+`nc_followup.php` and `rca.php` and replace them with the single
+merged entry from `sidebar_patch.php`:
+
+```php
+[
+    'label'  => 'Follow-up & RCA',
+    'url'    => 'followup.php',
+    'icon'   => 'fa-tasks',
+    'active' => in_array(basename($_SERVER['PHP_SELF']),
+                    ['followup.php','nc_followup.php','rca.php'], true),
+],
+```
+
+---
+
+## Step 5 — Copy Main File
+
+Copy `followup.php` to `C:\xampp\htdocs\qats\followup.php`.
+Copy `nc_followup.php` and `rca.php` (redirect shims) to overwrite the originals.
+
+---
+
+## Status Lifecycle
+
+```
+Audit saved → pending
+     ↓
+Department head enters RCA → in_progress (Save Draft)
+     ↓
+Department head submits → submitted
+     ↓
+PQC reviews:
+  Verify → verified (removed from active list)
+  Reject → rejected (dept sees rejection reason, must resubmit)
+     ↓ (on rejection)
+Department resubmits → submitted → PQC verifies again
+```
+
+---
+
+## Role Access Matrix
+
+| Role / Dept | What they see | What they can do |
+|---|---|---|
+| Admin / PQC / QA dept | All departments, all NCs | Verify, Reject, Bulk-verify |
+| Maintenance dept | Only Maintenance NCs | Enter RCA, Save Draft, Submit |
+| Production dept | Only Production NCs | Enter RCA, Save Draft, Submit |
+| Other depts | Only their own NCs | Enter RCA, Save Draft, Submit |
+| Auditor (no dept) | Read-only list | No edit |
+
+---
+
+## Notes
+
+- Old `nc_followup.php` and `rca.php` URLs redirect automatically — no broken links.
+- Evidence files upload to `uploads/nc_evidence/` (auto-created if missing).
+- Verified/Closed NCs are hidden from the "Active NCs" tab but visible under "Verified / Closed".
+- Rejected NCs auto-expand their RCA form on page load so dept heads see the rejection reason immediately.
+- The "Verify All Submitted" button lets PQC close everything in one click.
+- Bulk verify uses checkboxes — only `submitted` NCs are bulk-selectable.
