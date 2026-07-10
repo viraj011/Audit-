@@ -1,0 +1,5 @@
+<?php
+// rca.php — redirect shim
+// Old URL still works; bookmarks and links won't break.
+header('Location: followup.php');
+exit;
