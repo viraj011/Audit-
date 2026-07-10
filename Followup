@@ -1,0 +1,1201 @@
+<?php
+// ============================================================
+//  followup.php  —  Unified Follow-up & RCA Module
+//  Replaces both nc_followup.php and rca.php
+// ============================================================
+require_once __DIR__ . '/config/db.php';
+require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/helpers.php';
+require_once __DIR__ . '/includes/components.php';
+
+$user    = requireLogin();
+$db      = db();
+
+$userDept    = trim($user['department'] ?? '');
+$userGenId   = $user['gen_id'] ?? '';
+$userRole    = strtolower($user['role'] ?? '');
+$can_admin   = !empty($user['can_admin']);
+$isPQC       = $can_admin
+            || in_array($userRole, ['admin','pqc','quality'], true)
+            || in_array(strtolower($userDept), ['pqc','quality','qa'], true);
+
+// ── Upload dir ──────────────────────────────────────────────
+$uploadDir = __DIR__ . '/uploads/nc_evidence/';
+if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
+
+// ============================================================
+//  POST HANDLERS
+// ============================================================
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    $ncId   = (int)($_POST['nc_id'] ?? 0);
+
+    // ── Department: Save RCA / update single NC ──────────────
+    if ($action === 'dept_save' && $ncId > 0) {
+
+        // Verify ownership (dept users can only update their dept's NCs)
+        if (!$isPQC) {
+            $own = $db->prepare("SELECT id FROM nc_followups WHERE id=? AND department=?");
+            $own->execute([$ncId, $userDept]);
+            if (!$own->fetchColumn()) { flash('error','Access denied.'); header('Location: followup.php'); exit; }
+        }
+
+        $rootCause  = trim($_POST['root_cause']        ?? '');
+        $corrAction = trim($_POST['corrective_action'] ?? '');
+        $responsible= trim($_POST['responsible']       ?? '');
+        $rcaNotes   = trim($_POST['rca_notes']         ?? '');
+        $closeDate  = trim($_POST['completion_date']   ?? '') ?: null;
+        $newStatus  = $_POST['status'] ?? 'in_progress';
+
+        // Validate status transition
+        $allowed = ['pending','in_progress','submitted'];
+        if (!in_array($newStatus, $allowed, true)) $newStatus = 'in_progress';
+
+        // Evidence upload
+        $evidencePath = null; $evidenceName = null;
+        if (!empty($_FILES['evidence']['name'])) {
+            $ext      = strtolower(pathinfo($_FILES['evidence']['name'], PATHINFO_EXTENSION));
+            $allowed_ext = ['jpg','jpeg','png','pdf','xlsx','xls','docx','doc'];
+            if (in_array($ext, $allowed_ext, true) && $_FILES['evidence']['error'] === UPLOAD_ERR_OK) {
+                $fname        = 'nc_' . $ncId . '_' . time() . '.' . $ext;
+                $dest         = $uploadDir . $fname;
+                if (move_uploaded_file($_FILES['evidence']['tmp_name'], $dest)) {
+                    $evidencePath = 'uploads/nc_evidence/' . $fname;
+                    $evidenceName = $_FILES['evidence']['name'];
+                }
+            }
+        }
+
+        $submittedAt = ($newStatus === 'submitted') ? date('Y-m-d H:i:s') : null;
+        $submittedBy = ($newStatus === 'submitted') ? $userGenId           : null;
+
+        $upd = $db->prepare("
+            UPDATE nc_followups SET
+                root_cause          = :rc,
+                corrective_action   = :ca,
+                responsible         = :resp,
+                rca_notes           = :notes,
+                completion_date     = :cdate,
+                status              = :status,
+                submitted_by        = COALESCE(:sby, submitted_by),
+                submitted_at        = COALESCE(:sat, submitted_at),
+                evidence_path       = COALESCE(:epath, evidence_path),
+                evidence_name       = COALESCE(:ename, evidence_name)
+            WHERE id = :id
+        ");
+        $upd->execute([
+            ':rc'     => $rootCause   ?: null,
+            ':ca'     => $corrAction  ?: null,
+            ':resp'   => $responsible ?: null,
+            ':notes'  => $rcaNotes    ?: null,
+            ':cdate'  => $closeDate,
+            ':status' => $newStatus,
+            ':sby'    => $submittedBy,
+            ':sat'    => $submittedAt,
+            ':epath'  => $evidencePath,
+            ':ename'  => $evidenceName,
+            ':id'     => $ncId,
+        ]);
+
+        flash('success', $newStatus === 'submitted'
+            ? 'Follow-up submitted for QA verification.'
+            : 'Follow-up saved successfully.');
+        header('Location: followup.php#nc-' . $ncId);
+        exit;
+    }
+
+    // ── PQC: Verify single or bulk ───────────────────────────
+    if ($action === 'verify' && $isPQC) {
+        $ids = isset($_POST['nc_ids']) ? array_map('intval', (array)$_POST['nc_ids']) : ($ncId ? [$ncId] : []);
+        if ($ids) {
+            $ph = implode(',', array_fill(0, count($ids), '?'));
+            $p  = array_merge([$userGenId, date('Y-m-d H:i:s')], $ids);
+            $db->prepare("UPDATE nc_followups SET status='verified', verified_by=?, verified_at=? WHERE id IN ($ph)")->execute($p);
+            flash('success', count($ids) . ' NC(s) marked as Verified & Closed.');
+        }
+        header('Location: followup.php');
+        exit;
+    }
+
+    // ── PQC: Reject ─────────────────────────────────────────
+    if ($action === 'reject' && $isPQC && $ncId > 0) {
+        $reason = trim($_POST['rejection_reason'] ?? '');
+        $db->prepare("UPDATE nc_followups SET status='rejected', rejection_reason=?, verified_by=?, verified_at=? WHERE id=?")
+           ->execute([$reason ?: 'Rejected by QA.', $userGenId, date('Y-m-d H:i:s'), $ncId]);
+        flash('success', 'NC rejected. Department notified.');
+        header('Location: followup.php');
+        exit;
+    }
+
+    // ── PQC: Bulk verify all submitted ──────────────────────
+    if ($action === 'verify_all_submitted' && $isPQC) {
+        $db->prepare("UPDATE nc_followups SET status='verified', verified_by=?, verified_at=? WHERE status='submitted'")
+           ->execute([$userGenId, date('Y-m-d H:i:s')]);
+        flash('success', 'All submitted NCs verified and closed.');
+        header('Location: followup.php');
+        exit;
+    }
+}
+
+// ============================================================
+//  FILTERS
+// ============================================================
+$fStatus  = $_GET['status']  ?? 'active';   // active | verified | all
+$fDept    = $_GET['dept']    ?? '';
+$fBlock   = $_GET['block']   ?? '';
+$fLine    = $_GET['line']    ?? '';
+$fStage   = $_GET['stage']   ?? '';
+$fDateFrom= $_GET['from']    ?? '';
+$fDateTo  = $_GET['to']      ?? '';
+$fSearch  = trim($_GET['q']  ?? '');
+
+// ============================================================
+//  QUERY  nc_followups
+// ============================================================
+$params = [];
+$where  = "WHERE 1=1";
+
+// Dept restriction for non-PQC
+if (!$isPQC) {
+    $where .= " AND nf.department = ?";
+    $params[] = $userDept;
+} elseif ($fDept !== '') {
+    $where .= " AND nf.department = ?";
+    $params[] = $fDept;
+}
+
+// Status filter
+if ($fStatus === 'active') {
+    $where .= " AND nf.status NOT IN ('verified','closed')";
+} elseif ($fStatus === 'closed') {
+    $where .= " AND nf.status IN ('verified','closed')";
+}
+// 'all' = no filter
+
+if ($fBlock !== '') { $where .= " AND nf.block = ?";  $params[] = $fBlock; }
+if ($fLine  !== '') { $where .= " AND nf.line  = ?";  $params[] = $fLine; }
+if ($fStage !== '') { $where .= " AND nf.stage = ?";  $params[] = $fStage; }
+if ($fDateFrom !== '') { $where .= " AND DATE(nf.created_at) >= ?"; $params[] = $fDateFrom; }
+if ($fDateTo   !== '') { $where .= " AND DATE(nf.created_at) <= ?"; $params[] = $fDateTo; }
+if ($fSearch !== '') {
+    $where .= " AND (nf.param LIKE ? OR nf.finding LIKE ? OR nf.audit_code LIKE ? OR nf.line LIKE ?)";
+    $s = '%' . $fSearch . '%';
+    array_push($params, $s, $s, $s, $s);
+}
+
+$sql = "
+    SELECT
+        nf.*,
+        a.model, a.shift, a.pass_rate,
+        a.created_at AS audit_date
+    FROM nc_followups nf
+    LEFT JOIN audits a ON a.id = nf.audit_id
+    $where
+    ORDER BY
+        FIELD(nf.status,'pending','rejected','in_progress','submitted','verified','closed'),
+        nf.due_date ASC,
+        nf.created_at DESC
+";
+$stmt = $db->prepare($sql);
+$stmt->execute($params);
+$allNCs = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// ── KPI counts ──────────────────────────────────────────────
+$kpiBase   = !$isPQC ? "WHERE department = " . $db->quote($userDept) : "WHERE 1=1";
+$kpi       = $db->query("
+    SELECT
+        COUNT(*) AS total,
+        SUM(status='pending')     AS pending,
+        SUM(status='in_progress') AS in_progress,
+        SUM(status='submitted')   AS submitted,
+        SUM(status='rejected')    AS rejected,
+        SUM(status IN ('verified','closed')) AS closed,
+        SUM(status NOT IN ('verified','closed') AND due_date < CURDATE()) AS overdue
+    FROM nc_followups $kpiBase
+")->fetch(PDO::FETCH_ASSOC);
+
+// ── Grouping for display ─────────────────────────────────────
+// Group by department (PQC view) then by stage within each dept
+$grouped = [];
+foreach ($allNCs as $nc) {
+    $dept  = $nc['department'] ?: 'Unassigned';
+    $stage = $nc['stage']      ?: 'General';
+    $grouped[$dept][$stage][] = $nc;
+}
+ksort($grouped);
+
+// ── Distinct filter options ──────────────────────────────────
+$depts  = $db->query("SELECT DISTINCT department FROM nc_followups WHERE department IS NOT NULL AND department<>'' ORDER BY department")->fetchAll(PDO::FETCH_COLUMN);
+$blocks = ['A','B','C','D','E'];
+$stages = $db->query("SELECT DISTINCT stage FROM nc_followups WHERE stage IS NOT NULL AND stage<>'' ORDER BY stage")->fetchAll(PDO::FETCH_COLUMN);
+$lines  = $db->query("SELECT name FROM production_lines WHERE active=1 ORDER BY sort_order")->fetchAll(PDO::FETCH_COLUMN);
+
+$pageTitle = 'Follow-up & RCA';
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<?php include __DIR__ . '/includes/_head.php'; ?>
+<style>
+/* ═══════════════════════════════════════════════
+   FOLLOW-UP MODULE — QATS DARK THEME
+═══════════════════════════════════════════════ */
+
+/* KPI Strip */
+.fu-kpi-strip {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    gap: 10px;
+    margin-bottom: 20px;
+}
+.fu-kpi {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    text-align: center;
+    transition: transform .15s;
+}
+.fu-kpi:hover { transform: translateY(-2px); }
+.fu-kpi-label {
+    font-size: 10px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+.fu-kpi-val {
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 1;
+}
+.kpi-total     { color: var(--text); }
+.kpi-pending   { color: #ff5263; }
+.kpi-progress  { color: #ffb340; }
+.kpi-submitted { color: #2f9bff; }
+.kpi-rejected  { color: #ff7800; }
+.kpi-closed    { color: #20d38a; }
+.kpi-overdue   { color: #ff0040; }
+
+/* Filter sidebar */
+.fu-layout {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 18px;
+    align-items: start;
+}
+.fu-filters {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    position: sticky;
+    top: 80px;
+}
+.fu-filters h6 {
+    font-size: 10px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+}
+.fu-filter-item { margin-bottom: 10px; }
+.fu-filter-item label {
+    font-size: 10px;
+    color: var(--text-muted);
+    display: block;
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+}
+.fu-filter-item select,
+.fu-filter-item input {
+    width: 100%;
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 11px;
+    padding: 6px 9px;
+    outline: none;
+}
+.fu-filter-item select:focus,
+.fu-filter-item input:focus { border-color: var(--accent); }
+
+/* Status tabs */
+.fu-tab-bar {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 18px;
+}
+.fu-tab {
+    padding: 9px 18px;
+    font-size: 12px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    text-decoration: none;
+    transition: all .15s;
+    white-space: nowrap;
+}
+.fu-tab:hover { color: var(--text); }
+.fu-tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+
+/* Department section */
+.fu-dept-section {
+    margin-bottom: 24px;
+}
+.fu-dept-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px 8px 0 0;
+    cursor: pointer;
+}
+.fu-dept-name {
+    font-weight: 700;
+    font-size: 13px;
+    flex: 1;
+}
+.fu-dept-count {
+    font-size: 10px;
+    padding: 2px 9px;
+    border-radius: 10px;
+    font-weight: 600;
+}
+.dept-body { border: 1px solid var(--border); border-top: none; border-radius: 0 0 8px 8px; overflow: hidden; }
+
+/* Stage sub-group */
+.fu-stage-group { border-bottom: 1px solid var(--border); }
+.fu-stage-group:last-child { border-bottom: none; }
+.fu-stage-header {
+    padding: 8px 14px;
+    background: rgba(255,255,255,.03);
+    font-size: 11px;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* NC Card */
+.nc-card {
+    background: var(--card-bg);
+    border-left: 3px solid transparent;
+    padding: 14px 16px;
+    transition: background .15s;
+}
+.nc-card:hover { background: rgba(255,255,255,.02); }
+.nc-card + .nc-card { border-top: 1px solid var(--border); }
+
+/* Status border colors */
+.nc-pending   { border-left-color: #ff5263; }
+.nc-in_progress { border-left-color: #ffb340; }
+.nc-submitted { border-left-color: #2f9bff; }
+.nc-rejected  { border-left-color: #ff7800; }
+.nc-verified  { border-left-color: #20d38a; }
+.nc-closed    { border-left-color: #20d38a; opacity: .7; }
+
+.nc-top-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+.nc-param { font-weight: 700; font-size: 13px; flex: 1; }
+.nc-meta  { font-size: 10px; color: var(--text-muted); display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 8px; }
+.nc-meta span { display: flex; align-items: center; gap: 4px; }
+
+/* Status badges */
+.nc-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+.badge-pending    { background: rgba(255,82,99,.15);  color: #ff5263; border: 1px solid rgba(255,82,99,.3); }
+.badge-in_progress{ background: rgba(255,179,64,.12); color: #ffb340; border: 1px solid rgba(255,179,64,.3); }
+.badge-submitted  { background: rgba(47,155,255,.15); color: #2f9bff; border: 1px solid rgba(47,155,255,.3); }
+.badge-rejected   { background: rgba(255,120,0,.15);  color: #ff7800; border: 1px solid rgba(255,120,0,.3); }
+.badge-verified   { background: rgba(32,211,138,.15); color: #20d38a; border: 1px solid rgba(32,211,138,.3); }
+.badge-closed     { background: rgba(32,211,138,.1);  color: #20d38a; border: 1px solid rgba(32,211,138,.2); }
+
+/* Finding box */
+.nc-finding {
+    background: rgba(255,82,99,.06);
+    border: 1px solid rgba(255,82,99,.2);
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-size: 11px;
+    color: #ff8090;
+    margin-bottom: 10px;
+}
+
+/* RCA Accordion */
+.nc-rca-toggle {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-muted);
+    font-size: 11px;
+    padding: 5px 12px;
+    cursor: pointer;
+    transition: all .2s;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.nc-rca-toggle:hover { border-color: var(--accent); color: var(--accent); }
+.nc-rca-toggle.open  { border-color: var(--accent); color: var(--accent); background: rgba(47,155,255,.07); }
+
+.nc-rca-body {
+    display: none;
+    margin-top: 12px;
+    background: var(--panel-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+}
+.nc-rca-body.open { display: block; }
+
+/* RCA form grid */
+.rca-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.rca-grid.full { grid-template-columns: 1fr; }
+.rca-field label {
+    font-size: 10px;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 5px;
+    display: block;
+}
+.rca-field textarea,
+.rca-field input,
+.rca-field select {
+    width: 100%;
+    background: var(--input-bg);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    color: var(--text);
+    font-size: 12px;
+    padding: 8px 11px;
+    outline: none;
+    font-family: inherit;
+    resize: vertical;
+    transition: border-color .2s;
+}
+.rca-field textarea:focus,
+.rca-field input:focus,
+.rca-field select:focus { border-color: var(--accent); }
+.rca-field textarea { min-height: 72px; }
+
+/* Existing RCA values (read-back) */
+.rca-existing {
+    background: rgba(32,211,138,.05);
+    border: 1px solid rgba(32,211,138,.15);
+    border-radius: 6px;
+    padding: 10px 13px;
+    font-size: 11px;
+    color: var(--text);
+    margin-bottom: 12px;
+}
+.rca-existing-label {
+    font-size: 9px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 3px;
+}
+
+/* PQC Action buttons */
+.fu-action-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.btn-verify {
+    background: rgba(32,211,138,.12);
+    border: 1px solid rgba(32,211,138,.35);
+    color: #20d38a;
+    border-radius: 7px;
+    padding: 6px 14px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all .2s;
+    font-weight: 600;
+}
+.btn-verify:hover { background: rgba(32,211,138,.25); }
+.btn-reject {
+    background: rgba(255,120,0,.1);
+    border: 1px solid rgba(255,120,0,.3);
+    color: #ff7800;
+    border-radius: 7px;
+    padding: 6px 14px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all .2s;
+    font-weight: 600;
+}
+.btn-reject:hover { background: rgba(255,120,0,.22); }
+.btn-save-rca {
+    background: linear-gradient(135deg, rgba(47,155,255,.2), rgba(32,211,138,.12));
+    border: 1px solid rgba(47,155,255,.4);
+    color: #2f9bff;
+    border-radius: 7px;
+    padding: 7px 18px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all .2s;
+}
+.btn-save-rca:hover { background: rgba(47,155,255,.3); }
+.btn-submit-qa {
+    background: linear-gradient(135deg, rgba(32,211,138,.2), rgba(47,155,255,.12));
+    border: 1px solid rgba(32,211,138,.4);
+    color: #20d38a;
+    border-radius: 7px;
+    padding: 7px 18px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all .2s;
+}
+.btn-submit-qa:hover { background: rgba(32,211,138,.3); }
+
+/* Rejection notice */
+.rejection-notice {
+    background: rgba(255,120,0,.08);
+    border: 1px solid rgba(255,120,0,.25);
+    border-radius: 6px;
+    padding: 9px 13px;
+    font-size: 11px;
+    color: #ff9040;
+    margin-bottom: 10px;
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+}
+
+/* Overdue chip */
+.chip-overdue {
+    background: rgba(255,0,64,.14);
+    color: #ff0040;
+    border: 1px solid rgba(255,0,64,.3);
+    border-radius: 10px;
+    font-size: 9px;
+    padding: 2px 8px;
+    font-weight: 700;
+}
+
+/* Due date warning */
+.due-warning  { color: #ff7800; }
+.due-ok       { color: var(--text-muted); }
+.due-overdue  { color: #ff0040; font-weight: 700; }
+
+/* Empty state */
+.fu-empty {
+    text-align: center;
+    padding: 56px 24px;
+    color: var(--text-muted);
+}
+.fu-empty-icon { font-size: 44px; margin-bottom: 12px; opacity: .4; }
+
+/* Bulk verify bar */
+.bulk-bar {
+    background: rgba(47,155,255,.08);
+    border: 1px solid rgba(47,155,255,.2);
+    border-radius: 8px;
+    padding: 10px 16px;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 12px;
+}
+.bulk-bar input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
+
+/* Reject modal */
+.modal-backdrop-custom {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.65);
+    z-index: 1040;
+    display: none;
+}
+.modal-backdrop-custom.show { display: block; }
+.reject-modal {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    width: 420px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    z-index: 1050;
+    display: none;
+    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+}
+.reject-modal.show { display: block; }
+
+/* Evidence link */
+.evidence-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10px;
+    color: var(--accent);
+    text-decoration: none;
+    background: rgba(47,155,255,.08);
+    border: 1px solid rgba(47,155,255,.2);
+    border-radius: 5px;
+    padding: 3px 9px;
+}
+.evidence-link:hover { background: rgba(47,155,255,.16); }
+
+/* Progress ring for each dept */
+.dept-progress { font-size: 10px; color: var(--text-muted); margin-left: auto; }
+
+/* Select all checkbox col */
+.nc-check-col { width: 32px; }
+.nc-cb { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+
+@media (max-width: 900px) {
+    .fu-layout { grid-template-columns: 1fr; }
+    .fu-filters { position: static; }
+    .fu-kpi-strip { grid-template-columns: repeat(4,1fr); }
+    .rca-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<?php include __DIR__ . '/includes/_topbar.php'; ?>
+<div class="qats-wrapper">
+<?php include __DIR__ . '/includes/_sidebar.php'; ?>
+<main class="qats-main">
+
+<?php // ── Flash messages ──
+foreach (take_flashes() as $f): ?>
+<div class="alert alert-<?= $f['type']==='success'?'success':'danger' ?> alert-dismissible fade show" role="alert">
+    <?= e($f['message']) ?>
+    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+</div>
+<?php endforeach; ?>
+
+<!-- PAGE HEADER -->
+<div class="d-flex align-items-center justify-content-between mb-3">
+    <div>
+        <h4 class="mb-0 fw-bold">
+            <i class="fas fa-tasks me-2" style="color:var(--accent)"></i>
+            Follow-up & RCA
+        </h4>
+        <div style="font-size:10px;color:var(--text-muted);letter-spacing:.07em;margin-top:2px;">
+            <?= $isPQC ? 'PQC VIEW — ALL DEPARTMENTS' : 'DEPARTMENT: ' . strtoupper(e($userDept)) ?>
+            &nbsp;·&nbsp; <?= date('D, d M Y H:i') ?>
+        </div>
+    </div>
+    <?php if ($isPQC): ?>
+    <div class="d-flex gap-2">
+        <!-- Bulk verify all submitted -->
+        <form method="POST" onsubmit="return confirm('Verify ALL submitted NCs?')">
+            <?= csrf_field() ?>
+            <input type="hidden" name="action" value="verify_all_submitted">
+            <button class="btn btn-sm" style="background:rgba(32,211,138,.12);border:1px solid rgba(32,211,138,.35);color:#20d38a;font-size:11px;">
+                <i class="fas fa-check-double me-1"></i> Verify All Submitted
+            </button>
+        </form>
+    </div>
+    <?php endif; ?>
+</div>
+
+<!-- KPI STRIP -->
+<div class="fu-kpi-strip">
+    <div class="fu-kpi">
+        <div class="fu-kpi-label">Total</div>
+        <div class="fu-kpi-val kpi-total"><?= (int)$kpi['total'] ?></div>
+    </div>
+    <div class="fu-kpi">
+        <div class="fu-kpi-label">Pending</div>
+        <div class="fu-kpi-val kpi-pending"><?= (int)$kpi['pending'] ?></div>
+    </div>
+    <div class="fu-kpi">
+        <div class="fu-kpi-label">In Progress</div>
+        <div class="fu-kpi-val kpi-progress"><?= (int)$kpi['in_progress'] ?></div>
+    </div>
+    <div class="fu-kpi">
+        <div class="fu-kpi-label">Submitted</div>
+        <div class="fu-kpi-val kpi-submitted"><?= (int)$kpi['submitted'] ?></div>
+    </div>
+    <div class="fu-kpi">
+        <div class="fu-kpi-label">Rejected</div>
+        <div class="fu-kpi-val kpi-rejected"><?= (int)$kpi['rejected'] ?></div>
+    </div>
+    <div class="fu-kpi">
+        <div class="fu-kpi-label">Verified</div>
+        <div class="fu-kpi-val kpi-closed"><?= (int)$kpi['closed'] ?></div>
+    </div>
+    <div class="fu-kpi">
+        <div class="fu-kpi-label">Overdue</div>
+        <div class="fu-kpi-val kpi-overdue"><?= (int)$kpi['overdue'] ?></div>
+    </div>
+</div>
+
+<!-- STATUS TABS -->
+<div class="fu-tab-bar">
+    <?php
+    $tabs = [
+        'active'  => 'Active NCs',
+        'closed'  => 'Verified / Closed',
+        'all'     => 'All',
+    ];
+    foreach ($tabs as $val => $label):
+        $active = ($fStatus === $val) ? 'active' : '';
+        $qs = http_build_query(array_merge($_GET, ['status' => $val]));
+    ?>
+    <a href="?<?= $qs ?>" class="fu-tab <?= $active ?>"><?= $label ?></a>
+    <?php endforeach; ?>
+</div>
+
+<!-- LAYOUT: FILTERS + CONTENT -->
+<div class="fu-layout">
+
+    <!-- ── FILTER SIDEBAR ── -->
+    <aside class="fu-filters">
+        <h6><i class="fas fa-filter me-1"></i> Filters</h6>
+        <form method="GET" id="filterForm">
+            <input type="hidden" name="status" value="<?= e($fStatus) ?>">
+
+            <?php if ($isPQC): ?>
+            <div class="fu-filter-item">
+                <label>Department</label>
+                <select name="dept" onchange="this.form.submit()">
+                    <option value="">All Departments</option>
+                    <?php foreach ($depts as $d): ?>
+                    <option value="<?= e($d) ?>" <?= $fDept===$d?'selected':'' ?>><?= e($d) ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <?php endif; ?>
+
+            <div class="fu-filter-item">
+                <label>Block</label>
+                <select name="block" onchange="this.form.submit()">
+                    <option value="">All Blocks</option>
+                    <?php foreach ($blocks as $b): ?>
+                    <option value="<?= $b ?>" <?= $fBlock===$b?'selected':'' ?>>Block <?= $b ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="fu-filter-item">
+                <label>Line</label>
+                <select name="line" onchange="this.form.submit()">
+                    <option value="">All Lines</option>
+                    <?php foreach ($lines as $l): ?>
+                    <option value="<?= e($l) ?>" <?= $fLine===$l?'selected':'' ?>><?= e($l) ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="fu-filter-item">
+                <label>Stage</label>
+                <select name="stage" onchange="this.form.submit()">
+                    <option value="">All Stages</option>
+                    <?php foreach ($stages as $s): ?>
+                    <option value="<?= e($s) ?>" <?= $fStage===$s?'selected':'' ?>><?= e($s) ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="fu-filter-item">
+                <label>From Date</label>
+                <input type="date" name="from" value="<?= e($fDateFrom) ?>" onchange="this.form.submit()">
+            </div>
+            <div class="fu-filter-item">
+                <label>To Date</label>
+                <input type="date" name="to" value="<?= e($fDateTo) ?>" onchange="this.form.submit()">
+            </div>
+            <div class="fu-filter-item">
+                <label>Search</label>
+                <input type="text" name="q" value="<?= e($fSearch) ?>" placeholder="Param / code / line…">
+            </div>
+            <button type="submit" class="btn btn-sm w-100 mt-1"
+                    style="background:var(--accent);color:#000;font-weight:700;border-radius:7px;">
+                Apply
+            </button>
+            <a href="followup.php" class="btn btn-sm w-100 mt-1"
+               style="border:1px solid var(--border);color:var(--text-muted);border-radius:7px;">
+                Clear Filters
+            </a>
+        </form>
+    </aside>
+
+    <!-- ── MAIN CONTENT ── -->
+    <div class="fu-content">
+
+        <?php if (empty($allNCs)): ?>
+        <div class="fu-empty">
+            <div class="fu-empty-icon"><i class="fas fa-clipboard-check"></i></div>
+            <div style="font-size:15px;font-weight:600;margin-bottom:6px;">No Follow-ups Found</div>
+            <div style="font-size:12px;">
+                <?= $fStatus === 'active' ? 'All NCs are resolved — great work!' : 'No records match the current filters.' ?>
+            </div>
+        </div>
+
+        <?php else:
+        // PQC bulk verify form wrapper
+        if ($isPQC): ?>
+        <form method="POST" id="bulkForm">
+            <?= csrf_field() ?>
+            <input type="hidden" name="action" value="verify">
+            <div class="bulk-bar">
+                <input type="checkbox" id="selectAll" onchange="toggleAll(this)">
+                <label for="selectAll" style="margin:0;cursor:pointer;">Select All Submitted</label>
+                <button type="submit" class="btn-verify ms-auto" onclick="return confirm('Verify selected NCs?')">
+                    <i class="fas fa-check me-1"></i> Verify Selected
+                </button>
+            </div>
+        <?php endif; ?>
+
+        <!-- ── GROUPED BY DEPARTMENT → STAGE ── -->
+        <?php foreach ($grouped as $dept => $stageMap):
+            $deptTotal   = array_sum(array_map('count', $stageMap));
+            $deptVerified= 0;
+            foreach ($stageMap as $ncs) {
+                foreach ($ncs as $nc) {
+                    if (in_array($nc['status'],['verified','closed'],true)) $deptVerified++;
+                }
+            }
+            $deptPct = $deptTotal > 0 ? round($deptVerified/$deptTotal*100) : 0;
+        ?>
+        <div class="fu-dept-section" id="dept-<?= e(preg_replace('/\W+/','-',$dept)) ?>">
+            <div class="fu-dept-header" onclick="toggleDept(this)">
+                <i class="fas fa-building" style="color:var(--text-muted);font-size:13px;"></i>
+                <span class="fu-dept-name"><?= e($dept) ?></span>
+                <span class="fu-dept-count badge-pending"><?= $deptTotal ?> NC<?= $deptTotal!==1?'s':'' ?></span>
+                <span class="dept-progress"><?= $deptPct ?>% resolved</span>
+                <i class="fas fa-chevron-down ms-2" style="font-size:11px;color:var(--text-muted);transition:transform .2s;"></i>
+            </div>
+            <div class="dept-body">
+            <?php foreach ($stageMap as $stage => $ncs): ?>
+            <div class="fu-stage-group">
+                <div class="fu-stage-header">
+                    <i class="fas fa-layer-group"></i>
+                    <?= e($stage) ?>
+                    <span style="font-size:10px;background:rgba(255,255,255,.07);padding:1px 8px;border-radius:8px;">
+                        <?= count($ncs) ?>
+                    </span>
+                </div>
+                <?php foreach ($ncs as $nc):
+                    $ncId     = (int)$nc['id'];
+                    $status   = $nc['status'];
+                    $isOverdue= ($status !== 'verified' && $status !== 'closed')
+                                && !empty($nc['due_date'])
+                                && strtotime($nc['due_date']) < time();
+                    $daysLeft = $nc['due_date'] ? (int)ceil((strtotime($nc['due_date'])-time())/86400) : null;
+                    $dueCls   = $isOverdue ? 'due-overdue' : ($daysLeft !== null && $daysLeft <= 2 ? 'due-warning' : 'due-ok');
+                    $canEdit  = ($isPQC || strtolower($nc['department']) === strtolower($userDept))
+                             && !in_array($status, ['verified','closed'], true);
+                    $canVerify= $isPQC && $status === 'submitted';
+                    $canReject= $isPQC && in_array($status, ['submitted','in_progress'], true);
+                ?>
+                <div class="nc-card nc-<?= e($status) ?>" id="nc-<?= $ncId ?>">
+                    <div class="nc-top-row">
+                        <?php if ($isPQC && $status === 'submitted'): ?>
+                        <input type="checkbox" class="nc-cb" name="nc_ids[]" value="<?= $ncId ?>" form="bulkForm">
+                        <?php endif; ?>
+                        <div class="nc-param">
+                            <?= e($nc['param']) ?>
+                            <?php if ($isOverdue): ?>
+                            <span class="chip-overdue ms-1">OVERDUE</span>
+                            <?php endif; ?>
+                        </div>
+                        <span class="nc-badge badge-<?= e($status) ?>">
+                            <?= strtoupper(str_replace('_',' ',$status)) ?>
+                        </span>
+                    </div>
+
+                    <div class="nc-meta">
+                        <span><i class="fas fa-hashtag"></i> <?= e($nc['audit_code'] ?? $nc['audit_id']) ?></span>
+                        <span><i class="fas fa-industry"></i> <?= e($nc['line'] ?? '—') ?></span>
+                        <span><i class="fas fa-cube"></i> <?= e($nc['model'] ?? '—') ?></span>
+                        <?php if ($daysLeft !== null): ?>
+                        <span class="<?= $dueCls ?>">
+                            <i class="fas fa-calendar-alt"></i>
+                            Due: <?= date('d M', strtotime($nc['due_date'])) ?>
+                            (<?= $isOverdue ? abs($daysLeft).'d overdue' : $daysLeft.'d left' ?>)
+                        </span>
+                        <?php endif; ?>
+                        <?php if (!empty($nc['spec'])): ?>
+                        <span><i class="fas fa-ruler"></i> Spec: <?= e($nc['spec']) ?></span>
+                        <?php endif; ?>
+                    </div>
+
+                    <!-- Finding -->
+                    <div class="nc-finding">
+                        <i class="fas fa-exclamation-circle me-1"></i>
+                        <?= e($nc['finding']) ?>
+                    </div>
+
+                    <!-- Rejection notice -->
+                    <?php if ($status === 'rejected' && !empty($nc['rejection_reason'])): ?>
+                    <div class="rejection-notice">
+                        <i class="fas fa-ban"></i>
+                        <div>
+                            <strong>Rejected by QA</strong>
+                            <?php if (!empty($nc['verified_at'])): ?>
+                            <span style="font-size:9px;margin-left:8px;color:var(--text-muted)">
+                                <?= date('d M H:i', strtotime($nc['verified_at'])) ?>
+                            </span>
+                            <?php endif; ?>
+                            <div><?= e($nc['rejection_reason']) ?></div>
+                        </div>
+                    </div>
+                    <?php endif; ?>
+
+                    <!-- Existing RCA (read-back if already filled) -->
+                    <?php if (!empty($nc['root_cause']) || !empty($nc['corrective_action'])): ?>
+                    <div class="rca-existing mb-2">
+                        <?php if (!empty($nc['root_cause'])): ?>
+                        <div class="rca-existing-label">Root Cause</div>
+                        <div style="margin-bottom:6px;"><?= nl2br(e($nc['root_cause'])) ?></div>
+                        <?php endif; ?>
+                        <?php if (!empty($nc['corrective_action'])): ?>
+                        <div class="rca-existing-label">Corrective Action</div>
+                        <div><?= nl2br(e($nc['corrective_action'])) ?></div>
+                        <?php endif; ?>
+                        <?php if (!empty($nc['responsible'])): ?>
+                        <div class="rca-existing-label mt-1">Responsible</div>
+                        <div><?= e($nc['responsible']) ?></div>
+                        <?php endif; ?>
+                        <?php if (!empty($nc['evidence_path'])): ?>
+                        <div class="mt-1">
+                            <a href="<?= e($nc['evidence_path']) ?>" target="_blank" class="evidence-link">
+                                <i class="fas fa-paperclip"></i> <?= e($nc['evidence_name'] ?: 'Evidence') ?>
+                            </a>
+                        </div>
+                        <?php endif; ?>
+                    </div>
+                    <?php endif; ?>
+
+                    <!-- Actions row -->
+                    <div class="fu-action-row">
+                        <!-- Toggle RCA form -->
+                        <?php if ($canEdit): ?>
+                        <button type="button" class="nc-rca-toggle" onclick="toggleRCA(<?= $ncId ?>)">
+                            <i class="fas fa-edit"></i>
+                            <?= (empty($nc['root_cause']) && empty($nc['corrective_action'])) ? 'Enter RCA' : 'Edit RCA' ?>
+                        </button>
+                        <?php endif; ?>
+
+                        <!-- PQC: Verify / Reject -->
+                        <?php if ($canVerify): ?>
+                        <form method="POST" style="display:inline;">
+                            <?= csrf_field() ?>
+                            <input type="hidden" name="action"  value="verify">
+                            <input type="hidden" name="nc_id"   value="<?= $ncId ?>">
+                            <input type="hidden" name="nc_ids[]" value="<?= $ncId ?>">
+                            <button type="submit" class="btn-verify" onclick="return confirm('Mark this NC as Verified & Closed?')">
+                                <i class="fas fa-check-circle me-1"></i> Verify & Close
+                            </button>
+                        </form>
+                        <?php endif; ?>
+                        <?php if ($canReject): ?>
+                        <button type="button" class="btn-reject"
+                                onclick="openRejectModal(<?= $ncId ?>)">
+                            <i class="fas fa-times-circle me-1"></i> Reject
+                        </button>
+                        <?php endif; ?>
+
+                        <!-- Submitted by / verified by meta -->
+                        <?php if (!empty($nc['submitted_by'])): ?>
+                        <span style="font-size:10px;color:var(--text-muted);margin-left:auto;">
+                            Submitted by <?= e($nc['submitted_by']) ?>
+                            <?= !empty($nc['submitted_at']) ? '· '.date('d M H:i',strtotime($nc['submitted_at'])) : '' ?>
+                        </span>
+                        <?php endif; ?>
+                        <?php if (!empty($nc['verified_by']) && in_array($status,['verified','closed'],true)): ?>
+                        <span style="font-size:10px;color:#20d38a;margin-left:auto;">
+                            <i class="fas fa-check-circle"></i>
+                            Verified by <?= e($nc['verified_by']) ?>
+                            <?= !empty($nc['verified_at']) ? '· '.date('d M H:i',strtotime($nc['verified_at'])) : '' ?>
+                        </span>
+                        <?php endif; ?>
+                    </div>
+
+                    <!-- ── RCA FORM (accordion) ── -->
+                    <?php if ($canEdit): ?>
+                    <div class="nc-rca-body" id="rca-<?= $ncId ?>">
+                        <form method="POST" enctype="multipart/form-data">
+                            <?= csrf_field() ?>
+                            <input type="hidden" name="action" value="dept_save">
+                            <input type="hidden" name="nc_id"  value="<?= $ncId ?>">
+
+                            <div class="rca-grid">
+                                <div class="rca-field" style="grid-column:1/-1">
+                                    <label><i class="fas fa-search me-1"></i> Root Cause Analysis *</label>
+                                    <textarea name="root_cause" placeholder="Describe the root cause of this nonconformity…" required><?= e($nc['root_cause'] ?? '') ?></textarea>
+                                </div>
+                                <div class="rca-field" style="grid-column:1/-1">
+                                    <label><i class="fas fa-wrench me-1"></i> Corrective Action *</label>
+                                    <textarea name="corrective_action" placeholder="Describe the corrective action taken or planned…" required><?= e($nc['corrective_action'] ?? '') ?></textarea>
+                                </div>
+                                <div class="rca-field">
+                                    <label><i class="fas fa-user me-1"></i> Responsible Person</label>
+                                    <input type="text" name="responsible" value="<?= e($nc['responsible'] ?? '') ?>" placeholder="Name or GEN ID">
+                                </div>
+                                <div class="rca-field">
+                                    <label><i class="fas fa-calendar-check me-1"></i> Closure Date</label>
+                                    <input type="date" name="completion_date" value="<?= e($nc['completion_date'] ?? '') ?>">
+                                </div>
+                                <div class="rca-field">
+                                    <label><i class="fas fa-flag me-1"></i> Status</label>
+                                    <select name="status">
+                                        <option value="in_progress" <?= ($nc['status']==='in_progress')?'selected':'' ?>>In Progress</option>
+                                        <option value="submitted"   <?= ($nc['status']==='submitted')  ?'selected':'' ?>>Submit for QA Verification</option>
+                                    </select>
+                                </div>
+                                <div class="rca-field">
+                                    <label><i class="fas fa-paperclip me-1"></i> Evidence (optional)</label>
+                                    <input type="file" name="evidence" accept=".jpg,.jpeg,.png,.pdf,.xlsx,.docx">
+                                </div>
+                                <div class="rca-field" style="grid-column:1/-1">
+                                    <label><i class="fas fa-comment me-1"></i> Remarks</label>
+                                    <textarea name="rca_notes" rows="2" placeholder="Additional notes…"><?= e($nc['rca_notes'] ?? '') ?></textarea>
+                                </div>
+                            </div>
+
+                            <div class="d-flex gap-2 mt-2">
+                                <button type="submit" name="status_override" value="in_progress" class="btn-save-rca"
+                                        onclick="document.querySelector('#rca-<?= $ncId ?> [name=status]').value='in_progress'">
+                                    <i class="fas fa-save me-1"></i> Save Draft
+                                </button>
+                                <button type="submit" class="btn-submit-qa"
+                                        onclick="if(!confirm('Submit this NC to QA for verification?')) return false; document.querySelector('#rca-<?= $ncId ?> [name=status]').value='submitted'">
+                                    <i class="fas fa-paper-plane me-1"></i> Submit to QA
+                                </button>
+                                <button type="button" class="btn-reject" onclick="toggleRCA(<?= $ncId ?>)">
+                                    Cancel
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                    <?php endif; // canEdit ?>
+
+                </div><!-- /nc-card -->
+                <?php endforeach; // ncs ?>
+            </div><!-- /stage-group -->
+            <?php endforeach; // stageMap ?>
+            </div><!-- /dept-body -->
+        </div><!-- /dept-section -->
+        <?php endforeach; // grouped ?>
+
+        <?php if ($isPQC): ?>
+        </form><!-- /bulkForm -->
+        <?php endif; ?>
+
+        <?php endif; // !empty allNCs ?>
+
+    </div><!-- /fu-content -->
+</div><!-- /fu-layout -->
+
+</main>
+</div><!-- /qats-wrapper -->
+
+<!-- ── REJECT MODAL ── -->
+<div class="modal-backdrop-custom" id="rejectBackdrop" onclick="closeRejectModal()"></div>
+<div class="reject-modal" id="rejectModal">
+    <h6 style="font-weight:700;margin-bottom:14px;">
+        <i class="fas fa-times-circle me-2" style="color:#ff7800"></i>Reject NC Follow-up
+    </h6>
+    <form method="POST">
+        <?= csrf_field() ?>
+        <input type="hidden" name="action" value="reject">
+        <input type="hidden" name="nc_id"  id="rejectNcId" value="">
+        <div class="rca-field mb-3">
+            <label>Rejection Reason *</label>
+            <textarea name="rejection_reason" rows="3" required
+                      placeholder="Explain why this submission is rejected and what needs to be corrected…"
+                      style="width:100%;background:var(--input-bg);border:1px solid var(--border);border-radius:7px;color:var(--text);padding:9px 12px;font-size:12px;outline:none;resize:vertical;"></textarea>
+        </div>
+        <div class="d-flex gap-2">
+            <button type="submit" class="btn-reject" style="flex:1;">
+                <i class="fas fa-ban me-1"></i> Reject & Notify
+            </button>
+            <button type="button" class="btn-save-rca" onclick="closeRejectModal()">Cancel</button>
+        </div>
+    </form>
+</div>
+
+<?php include __DIR__ . '/includes/_foot.php'; ?>
+
+<script>
+// Toggle RCA accordion
+function toggleRCA(id) {
+    const body   = document.getElementById('rca-' + id);
+    const toggle = body && body.previousElementSibling
+                       ? body.closest('.nc-card').querySelector('.nc-rca-toggle')
+                       : null;
+    if (!body) return;
+    const isOpen = body.classList.contains('open');
+    body.classList.toggle('open');
+    if (toggle) toggle.classList.toggle('open', !isOpen);
+    if (!isOpen) body.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// Auto-open RCA for rejected NCs
+document.querySelectorAll('.nc-card.nc-rejected .nc-rca-toggle').forEach(btn => {
+    const ncId = btn.getAttribute('onclick').match(/\d+/)?.[0];
+    if (ncId) {
+        const body = document.getElementById('rca-' + ncId);
+        if (body) { body.classList.add('open'); btn.classList.add('open'); }
+    }
+});
+
+// Toggle dept section
+function toggleDept(header) {
+    const body    = header.nextElementSibling;
+    const chevron = header.querySelector('.fa-chevron-down, .fa-chevron-up');
+    body.style.display = (body.style.display === 'none') ? '' : 'none';
+    if (chevron) {
+        chevron.classList.toggle('fa-chevron-down');
+        chevron.classList.toggle('fa-chevron-up');
+    }
+}
+
+// Bulk select (only submitted checkboxes)
+function toggleAll(master) {
+    document.querySelectorAll('.nc-cb').forEach(cb => { cb.checked = master.checked; });
+}
+
+// Reject modal
+function openRejectModal(ncId) {
+    document.getElementById('rejectNcId').value   = ncId;
+    document.getElementById('rejectModal').classList.add('show');
+    document.getElementById('rejectBackdrop').classList.add('show');
+}
+function closeRejectModal() {
+    document.getElementById('rejectModal').classList.remove('show');
+    document.getElementById('rejectBackdrop').classList.remove('show');
+}
+
+// Hash scroll on page load (e.g. after save)
+if (location.hash) {
+    const el = document.querySelector(location.hash);
+    if (el) setTimeout(() => el.scrollIntoView({ behavior: 'smooth', block: 'center' }), 200);
+}
+
+// Auto-dismiss alerts
+setTimeout(() => {
+    document.querySelectorAll('.alert-success').forEach(a => {
+        const bsAlert = bootstrap.Alert.getOrCreateInstance(a);
+        bsAlert && bsAlert.close();
+    });
+}, 4000);
+</script>
+</body>
+</html>
