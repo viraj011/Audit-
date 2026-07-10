@@ -1,0 +1,940 @@
+<?php
+/* ============================================================================
+ *  nc_rca.php — Unified NC Follow-up & RCA Module
+ *  ---------------------------------------------------------------------------
+ *  Merges the old nc_followup / rca separation into one page.
+ *
+ *  FLOW:
+ *  1. When audit is saved, save_audit() creates rows in `nonconformities`
+ *     for every NG (already exists). This page links those NCs to rca_entries.
+ *  2. Department heads see only NCs where department matches their role/dept.
+ *  3. They fill Root Cause + Corrective Action + Status and save → rca_entries.
+ *  4. PQC/Admin can Verify (mark closed) or Reject (sends back to open).
+ *
+ *  DB tables used (no schema changes — works with existing tables):
+ *    - nonconformities  (nc_code, audit_id, line, stage, defect_type, severity, status)
+ *    - audit_results    (department, remark columns — already added via updates.sql)
+ *    - rca_entries      (full RCA data — auto-created by qats_auto_migrate)
+ *    - audits           (for audit meta: model, shift, block, audit_code)
+ * ===========================================================================*/
+
+require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/helpers.php';
+require_once __DIR__ . '/includes/components.php';
+require_once __DIR__ . '/includes/audit_functions.php';
+requireLogin();
+
+$db  = db();
+$me  = currentUser();
+
+// ── Dept / role detection ────────────────────────────────────────────────────
+// In the real QATS users table there is no "department" column by default —
+// the role name IS the department key. We treat can_admin roles as PQC.
+$userRole    = strtolower($me['role']       ?? '');
+$userRoleLabel = $me['role_label'] ?? '';
+$isPQC       = !empty($me['can_admin'])
+            || in_array($userRole, ['admin', 'pqc', 'quality', 'quality manager'], true);
+
+// Department label to filter NCs (stored in audit_results.department)
+$DEPTS = ['Production', 'Material', 'Maintenance', 'Programming', 'Quality'];
+
+// Try to detect current user's department from their role_label
+$userDept = '';
+foreach ($DEPTS as $d) {
+    if (stripos($userRoleLabel, $d) !== false) { $userDept = $d; break; }
+}
+// If no dept matched but they're not PQC, default to showing all (they pick in filter)
+
+// ── Filters ──────────────────────────────────────────────────────────────────
+$fStatus  = $_GET['status'] ?? 'open';          // open | closed | all
+$fDept    = $_GET['dept']   ?? $userDept;
+$fBlock   = $_GET['block']  ?? '';
+$fLine    = $_GET['line']   ?? '';
+$fStage   = $_GET['stage']  ?? '';
+$fFrom    = $_GET['from']   ?? '';
+$fTo      = $_GET['to']     ?? '';
+$fPeriod  = in_array($_GET['period'] ?? '', ['daily','weekly','monthly']) ? $_GET['period'] : '';
+$fSearch  = trim($_GET['q'] ?? '');
+
+// ── Handle POST actions ───────────────────────────────────────────────────────
+$errors = [];
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!csrf_check()) { $errors[] = 'Session expired — please resubmit.'; goto RENDER; }
+
+    $action = $_POST['action'] ?? '';
+    $ncId   = (int)($_POST['nc_id'] ?? 0);
+
+    /* ── Save / update RCA entry ─────────────────────────────────────────── */
+    if ($action === 'save_rca' && $ncId > 0) {
+
+        // Load the NC to get line/stage/param/audit_code
+        $nc = $db->prepare("SELECT n.*, a.audit_code, a.line AS audit_line, a.block, a.model
+                             FROM nonconformities n
+                             LEFT JOIN audits a ON a.id = n.audit_id
+                             WHERE n.id = ? LIMIT 1");
+        $nc->execute([$ncId]);
+        $nc = $nc->fetch();
+
+        if (!$nc) { $errors[] = 'NC not found.'; goto RENDER; }
+
+        // Non-PQC: verify ownership via dept
+        if (!$isPQC && $fDept) {
+            // Check if the NG finding belongs to this dept (from audit_results)
+            $deptCheck = $db->prepare(
+                "SELECT COUNT(*) FROM audit_results ar
+                 JOIN audits a ON a.id = ar.audit_id
+                 WHERE a.id = ? AND ar.result = 'NG'
+                   AND ar.stage = ? AND ar.department = ?");
+            $deptCheck->execute([$nc['audit_id'], $nc['stage'], $fDept]);
+            if (!(int)$deptCheck->fetchColumn()) {
+                $errors[] = 'Access denied — this NC is not assigned to your department.';
+                goto RENDER;
+            }
+        }
+
+        $rootCause   = trim($_POST['root_cause']        ?? '');
+        $corrAction  = trim($_POST['corrective_action'] ?? '');
+        $responsible = trim($_POST['responsible']       ?? '');
+        $defectDesc  = trim($_POST['defect_desc']       ?? '');
+        $dueDate     = trim($_POST['due_date']          ?? '') ?: null;
+        $periodType  = $_POST['period_type'] ?? 'daily';
+        $periodDate  = match($periodType) {
+            'weekly'  => date('Y-m-d', strtotime('monday this week', strtotime($_POST['period_date'] ?? date('Y-m-d')))),
+            'monthly' => date('Y-m-01', strtotime($_POST['period_date'] ?? date('Y-m-d'))),
+            default   => $_POST['period_date'] ?? date('Y-m-d'),
+        };
+        $newStatus   = $_POST['rca_status'] ?? 'open';
+        if (!in_array($newStatus, ['open','in_progress','closed'], true)) $newStatus = 'open';
+
+        // Upsert into rca_entries (keyed by nc_id stored in audit_code field)
+        // We use audit_code + param + stage as the natural unique key
+        $auditCode = $nc['audit_code'] ?? null;
+        $line      = $nc['audit_line'] ?? $nc['line'];
+        $block     = $nc['block'] ?? (function_exists('block_for_line') ? block_for_line($line) : null);
+
+        // Check if an rca_entry already exists for this nc
+        $existing = $db->prepare(
+            "SELECT id FROM rca_entries
+             WHERE audit_code = ? AND stage = ? AND param = ? LIMIT 1");
+        $existing->execute([$auditCode, $nc['stage'], $nc['defect_type']]);
+        $rcaId = $existing->fetchColumn();
+
+        if ($rcaId) {
+            $db->prepare("UPDATE rca_entries SET
+                root_cause=?, corrective_action=?, responsible=?, defect_desc=?,
+                due_date=?, status=?, period_type=?, period_date=?
+                WHERE id=?")
+               ->execute([$rootCause, $corrAction, $responsible, $defectDesc,
+                          $dueDate, $newStatus, $periodType, $periodDate, $rcaId]);
+        } else {
+            $db->prepare("INSERT INTO rca_entries
+                (audit_code, line, block, stage, param, defect_desc,
+                 root_cause, corrective_action, responsible,
+                 due_date, status, period_type, period_date, created_by)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+               ->execute([$auditCode, $line, $block, $nc['stage'], $nc['defect_type'],
+                          $defectDesc, $rootCause, $corrAction, $responsible,
+                          $dueDate, $newStatus, $periodType, $periodDate,
+                          $me['name'] ?? '']);
+        }
+
+        // If status = closed → close the NC too
+        if ($newStatus === 'closed') {
+            $db->prepare("UPDATE nonconformities SET status='closed', closed_at=NOW() WHERE id=?")
+               ->execute([$ncId]);
+        } elseif ($newStatus === 'in_progress') {
+            $db->prepare("UPDATE nonconformities SET status='in_review' WHERE id=? AND status='open'")
+               ->execute([$ncId]);
+        }
+
+        flash('RCA entry saved successfully.', 'success');
+        header('Location: nc_rca.php?' . http_build_query(array_filter([
+            'status'=>$fStatus,'dept'=>$fDept,'block'=>$fBlock,'line'=>$fLine,
+            'stage'=>$fStage,'from'=>$fFrom,'to'=>$fTo,'period'=>$fPeriod,
+        ])));
+        exit;
+    }
+
+    /* ── PQC: Verify / close ─────────────────────────────────────────────── */
+    if ($action === 'verify' && $isPQC && $ncId > 0) {
+        $db->prepare("UPDATE nonconformities SET status='closed', closed_at=NOW() WHERE id=?")
+           ->execute([$ncId]);
+        // Also close linked rca_entry
+        $nc2 = $db->prepare("SELECT n.*, a.audit_code FROM nonconformities n LEFT JOIN audits a ON a.id=n.audit_id WHERE n.id=?");
+        $nc2->execute([$ncId]);
+        $nc2 = $nc2->fetch();
+        if ($nc2) {
+            $db->prepare("UPDATE rca_entries SET status='closed' WHERE audit_code=? AND stage=? AND param=?")
+               ->execute([$nc2['audit_code']??null, $nc2['stage'], $nc2['defect_type']]);
+        }
+        flash('NC verified and closed.', 'success');
+        header('Location: nc_rca.php?' . http_build_query(array_filter(['status'=>$fStatus,'dept'=>$fDept,'block'=>$fBlock])));
+        exit;
+    }
+
+    /* ── PQC: Reopen / reject ────────────────────────────────────────────── */
+    if ($action === 'reopen' && $isPQC && $ncId > 0) {
+        $db->prepare("UPDATE nonconformities SET status='open', closed_at=NULL WHERE id=?")
+           ->execute([$ncId]);
+        $reason = trim($_POST['reject_reason'] ?? '');
+        $nc2 = $db->prepare("SELECT n.*, a.audit_code FROM nonconformities n LEFT JOIN audits a ON a.id=n.audit_id WHERE n.id=?");
+        $nc2->execute([$ncId]);
+        $nc2 = $nc2->fetch();
+        if ($nc2) {
+            $db->prepare("UPDATE rca_entries SET status='open', responsible=CONCAT(COALESCE(responsible,''),' [Rejected: ".addslashes($reason)."') WHERE audit_code=? AND stage=? AND param=?")
+               ->execute([$nc2['audit_code']??null, $nc2['stage'], $nc2['defect_type']]);
+        }
+        flash('NC rejected and sent back for rework.', 'warning');
+        header('Location: nc_rca.php?' . http_build_query(array_filter(['status'=>$fStatus,'dept'=>$fDept])));
+        exit;
+    }
+
+    /* ── Bulk verify all in_review ───────────────────────────────────────── */
+    if ($action === 'bulk_verify' && $isPQC) {
+        $db->exec("UPDATE nonconformities SET status='closed', closed_at=NOW() WHERE status='in_review'");
+        $db->exec("UPDATE rca_entries SET status='closed' WHERE status='in_progress'");
+        flash('All in-review NCs verified and closed.', 'success');
+        header('Location: nc_rca.php');
+        exit;
+    }
+}
+RENDER:
+
+// ── Build NC query ────────────────────────────────────────────────────────────
+$where = ['1=1'];
+$p     = [];
+
+// Status filter
+if ($fStatus === 'open')   { $where[] = "n.status IN ('open','in_review')"; }
+elseif ($fStatus === 'closed') { $where[] = "n.status = 'closed'"; }
+
+// Dept filter: join audit_results to get department
+// Non-PQC users only see their own dept's NGs
+if (!$isPQC && $userDept) {
+    $where[] = "EXISTS (
+        SELECT 1 FROM audit_results ar2
+        WHERE ar2.audit_id = n.audit_id
+          AND ar2.stage = n.stage
+          AND ar2.result = 'NG'
+          AND ar2.department = ?
+    )";
+    $p[] = $userDept;
+} elseif ($fDept !== '') {
+    $where[] = "EXISTS (
+        SELECT 1 FROM audit_results ar2
+        WHERE ar2.audit_id = n.audit_id
+          AND ar2.stage = n.stage
+          AND ar2.result = 'NG'
+          AND ar2.department = ?
+    )";
+    $p[] = $fDept;
+}
+
+if ($fBlock  !== '') { $where[] = 'a.block = ?';     $p[] = $fBlock; }
+if ($fLine   !== '') { $where[] = 'n.line = ?';      $p[] = $fLine; }
+if ($fStage  !== '') { $where[] = 'n.stage = ?';     $p[] = $fStage; }
+if ($fFrom   !== '') { $where[] = 'DATE(n.opened_at) >= ?'; $p[] = $fFrom; }
+if ($fTo     !== '') { $where[] = 'DATE(n.opened_at) <= ?'; $p[] = $fTo; }
+if ($fSearch !== '') {
+    $where[] = '(n.nc_code LIKE ? OR n.defect_type LIKE ? OR n.line LIKE ? OR a.audit_code LIKE ?)';
+    $s = '%' . $fSearch . '%';
+    array_push($p, $s, $s, $s, $s);
+}
+
+$sql = "
+    SELECT
+        n.*,
+        a.audit_code, a.model, a.shift, a.block AS audit_block,
+        a.pass_rate, a.created_at AS audit_date,
+        ar.department, ar.remark AS ng_remark, ar.spec, ar.value AS ng_value,
+        r.root_cause, r.corrective_action, r.responsible,
+        r.defect_desc, r.due_date AS rca_due,
+        r.status AS rca_status, r.period_type,
+        r.id AS rca_id, r.created_by AS rca_by
+    FROM nonconformities n
+    LEFT JOIN audits a ON a.id = n.audit_id
+    LEFT JOIN audit_results ar ON ar.audit_id = n.audit_id
+        AND ar.stage = n.stage
+        AND ar.result = 'NG'
+        ORDER BY ar.id ASC
+        LIMIT 1
+    LEFT JOIN (
+        SELECT re.*, ROW_NUMBER() OVER (PARTITION BY re.audit_code, re.stage, re.param ORDER BY re.id DESC) rn
+        FROM rca_entries re
+    ) r ON r.audit_code = a.audit_code
+        AND r.stage = n.stage
+        AND r.param = n.defect_type
+        AND r.rn = 1
+    WHERE " . implode(' AND ', $where) . "
+    ORDER BY
+        FIELD(n.status,'open','in_review','closed'),
+        n.opened_at DESC
+    LIMIT 300
+";
+
+// Fallback for MySQL < 8 (no ROW_NUMBER window function)
+$ncs = [];
+try {
+    $st = $db->prepare($sql);
+    $st->execute($p);
+    $ncs = $st->fetchAll();
+} catch (Throwable $e) {
+    // Simpler fallback without window function
+    $sql2 = "
+        SELECT
+            n.*,
+            a.audit_code, a.model, a.shift, a.block AS audit_block,
+            a.pass_rate, a.created_at AS audit_date,
+            ar.department, ar.remark AS ng_remark, ar.spec, ar.value AS ng_value
+        FROM nonconformities n
+        LEFT JOIN audits a ON a.id = n.audit_id
+        LEFT JOIN audit_results ar ON ar.audit_id = n.audit_id
+            AND ar.stage = n.stage AND ar.result = 'NG'
+        WHERE " . implode(' AND ', $where) . "
+        ORDER BY FIELD(n.status,'open','in_review','closed'), n.opened_at DESC
+        LIMIT 300
+    ";
+    try {
+        $st2 = $db->prepare($sql2);
+        $st2->execute($p);
+        $ncs = $st2->fetchAll();
+        // Manually fetch rca for each
+        $rcaSt = $db->prepare(
+            "SELECT * FROM rca_entries WHERE audit_code=? AND stage=? AND param=?
+             ORDER BY id DESC LIMIT 1");
+        foreach ($ncs as &$row) {
+            try {
+                $rcaSt->execute([$row['audit_code']??null, $row['stage'], $row['defect_type']]);
+                $rca = $rcaSt->fetch();
+                $row['root_cause']       = $rca['root_cause']       ?? null;
+                $row['corrective_action']= $rca['corrective_action'] ?? null;
+                $row['responsible']      = $rca['responsible']       ?? null;
+                $row['defect_desc']      = $rca['defect_desc']       ?? null;
+                $row['rca_due']          = $rca['due_date']          ?? null;
+                $row['rca_status']       = $rca['status']            ?? null;
+                $row['period_type']      = $rca['period_type']       ?? null;
+                $row['rca_id']           = $rca['id']                ?? null;
+                $row['rca_by']           = $rca['created_by']        ?? null;
+            } catch (Throwable $e2) {}
+        }
+        unset($row);
+    } catch (Throwable $e3) {
+        $errors[] = 'Query error: ' . $e3->getMessage();
+    }
+}
+
+// ── KPI counts ────────────────────────────────────────────────────────────────
+// Always count across the full dept scope (not just current filter)
+$kpiWhere = $isPQC ? '1=1' : "EXISTS (
+    SELECT 1 FROM audit_results ar3
+    JOIN audits a3 ON a3.id = ar3.audit_id
+    WHERE ar3.audit_id = n.audit_id AND ar3.stage = n.stage
+      AND ar3.result='NG' AND ar3.department=" . $db->quote($userDept) . "
+)";
+try {
+    $kpi = $db->query("
+        SELECT
+            COUNT(*)                                                  AS total,
+            SUM(n.status='open')                                      AS open_count,
+            SUM(n.status='in_review')                                 AS in_review,
+            SUM(n.status='closed')                                    AS closed_count,
+            SUM(n.severity IN ('high','critical'))                    AS high_sev,
+            SUM(n.status != 'closed' AND n.opened_at < DATE_SUB(NOW(), INTERVAL 7 DAY)) AS overdue
+        FROM nonconformities n WHERE $kpiWhere
+    ")->fetch(PDO::FETCH_ASSOC);
+} catch (Throwable $e) {
+    $kpi = ['total'=>0,'open_count'=>0,'in_review'=>0,'closed_count'=>0,'high_sev'=>0,'overdue'=>0];
+}
+
+// ── Group NCs by stage for display ───────────────────────────────────────────
+$byStage = [];
+foreach ($ncs as $nc) {
+    $byStage[$nc['stage'] ?? 'General'][] = $nc;
+}
+
+// ── Lines + Stages for filters ────────────────────────────────────────────────
+$lines  = []; try { $lines  = $db->query("SELECT name FROM production_lines WHERE active=1 ORDER BY sort_order, name")->fetchAll(PDO::FETCH_COLUMN); } catch(Throwable $e){}
+$stages = []; try { $stages = $db->query("SELECT DISTINCT stage FROM nonconformities WHERE stage IS NOT NULL ORDER BY stage")->fetchAll(PDO::FETCH_COLUMN); } catch(Throwable $e){}
+
+// ── Pending in-review count (for bulk verify button badge) ───────────────────
+$inReviewCount = 0;
+try { $inReviewCount = (int)$db->query("SELECT COUNT(*) FROM nonconformities WHERE status='in_review'")->fetchColumn(); } catch(Throwable $e){}
+
+$PAGE_TITLE   = 'NC Follow-up & RCA';
+$PAGE_HEADING = 'NC Follow-up & RCA';
+$PAGE_SUB     = $isPQC
+    ? 'All departments · Verify and close NG findings'
+    : 'Department: ' . ($userDept ?: $userRoleLabel) . ' · Enter root cause and corrective action';
+$ACTIVE = 'nc_rca';
+$ASSET  = '';
+include __DIR__ . '/includes/_head.php';
+?>
+<style>
+/* ── NC-RCA Module Styles (scoped, no conflicts with qats.css) ─────────────── */
+
+.ncrca-kpi-strip{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:20px}
+.ncrca-kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:13px 15px;text-align:center}
+.ncrca-kpi-label{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
+.ncrca-kpi-val{font-family:var(--font-display,inherit);font-size:26px;font-weight:800;line-height:1}
+
+.ncrca-layout{display:grid;grid-template-columns:200px 1fr;gap:16px;align-items:start}
+.ncrca-filters{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;position:sticky;top:80px}
+.ncrca-filters h6{font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.ncrca-filter-item{margin-bottom:9px}
+.ncrca-filter-item label{font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;display:block;margin-bottom:3px}
+.ncrca-filter-item select,.ncrca-filter-item input{width:100%}
+
+/* Status tabs */
+.ncrca-tabs{display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:16px}
+.ncrca-tab{padding:8px 16px;font-size:11.5px;cursor:pointer;border-bottom:2px solid transparent;color:var(--text-2,var(--muted));text-decoration:none;transition:all .15s;white-space:nowrap}
+.ncrca-tab:hover{color:var(--text)}
+.ncrca-tab.active{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+
+/* Stage group */
+.ncrca-stage{margin-bottom:20px}
+.ncrca-stage-head{display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--card-2);border:1px solid var(--border);border-radius:8px 8px 0 0;cursor:pointer;user-select:none}
+.ncrca-stage-name{font-weight:700;font-size:12.5px;flex:1}
+.ncrca-stage-body{border:1px solid var(--border);border-top:none;border-radius:0 0 8px 8px}
+
+/* NC card */
+.nc-row{padding:14px 16px;border-bottom:1px solid var(--border);border-left:3px solid transparent;background:var(--card);transition:background .12s}
+.nc-row:last-child{border-bottom:none;border-radius:0 0 8px 8px}
+.nc-row:hover{background:var(--raised,var(--card-2))}
+.nc-row.status-open    {border-left-color:var(--red)}
+.nc-row.status-in_review{border-left-color:var(--amber)}
+.nc-row.status-closed  {border-left-color:var(--green);opacity:.75}
+
+.nc-toprow{display:flex;align-items:flex-start;gap:10px;margin-bottom:6px}
+.nc-param{font-weight:700;font-size:13px;flex:1}
+.nc-meta{display:flex;flex-wrap:wrap;gap:12px;font-size:10.5px;color:var(--muted);margin-bottom:7px}
+.nc-finding{background:rgba(255,71,87,.07);border:1px solid rgba(255,71,87,.18);border-radius:6px;padding:6px 11px;font-size:11px;color:#ff8090;margin-bottom:8px}
+
+/* RCA accordion */
+.rca-toggle{background:none;border:1px solid var(--border);border-radius:6px;color:var(--muted);font-size:11px;padding:5px 11px;cursor:pointer;transition:all .18s;display:inline-flex;align-items:center;gap:5px}
+.rca-toggle:hover,.rca-toggle.open{border-color:var(--accent);color:var(--accent);background:rgba(var(--accent-rgb,0,212,255),.07)}
+.rca-body{display:none;margin-top:10px;background:var(--card-2);border:1px solid var(--border);border-radius:8px;padding:14px}
+.rca-body.open{display:block}
+.rca-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.rca-field label{font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);display:block;margin-bottom:4px}
+.rca-field textarea,.rca-field input,.rca-field select{width:100%;font-size:12px}
+.rca-field textarea{min-height:68px;resize:vertical}
+.rca-existing{background:rgba(var(--green-rgb,0,229,160),.06);border:1px solid rgba(var(--green-rgb,0,229,160),.15);border-radius:6px;padding:9px 12px;font-size:11px;margin-bottom:9px}
+.rca-existing-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:2px}
+
+/* Severity badge */
+.sev-low{color:var(--green)}.sev-medium{color:var(--amber)}.sev-high,.sev-critical{color:var(--red)}
+
+/* PQC actions */
+.btn-verify-nc{background:rgba(var(--green-rgb,0,229,160),.12);border:1px solid rgba(var(--green-rgb,0,229,160),.35);color:var(--green);border-radius:7px;padding:5px 13px;font-size:11px;cursor:pointer;transition:all .18s;font-weight:600}
+.btn-verify-nc:hover{background:rgba(var(--green-rgb,0,229,160),.25)}
+.btn-reopen-nc{background:rgba(var(--amber-rgb,255,179,64),.1);border:1px solid rgba(var(--amber-rgb,255,179,64),.3);color:var(--amber);border-radius:7px;padding:5px 13px;font-size:11px;cursor:pointer;transition:all .18s}
+.btn-reopen-nc:hover{background:rgba(var(--amber-rgb,255,179,64),.22)}
+
+/* Reject modal */
+.ncrca-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:1040}
+.ncrca-backdrop.show{display:block}
+.ncrca-modal{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:400px;max-width:95vw;background:var(--card);border:1px solid var(--border-2,var(--border));border-radius:12px;padding:22px;z-index:1050;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.ncrca-modal.show{display:block}
+
+/* Empty state */
+.ncrca-empty{text-align:center;padding:52px 24px;color:var(--muted)}
+.ncrca-empty i{font-size:40px;opacity:.35;margin-bottom:10px}
+
+@media(max-width:860px){
+  .ncrca-layout{grid-template-columns:1fr}
+  .ncrca-filters{position:static}
+  .ncrca-kpi-strip{grid-template-columns:repeat(3,1fr)}
+  .rca-grid{grid-template-columns:1fr}
+}
+</style>
+
+<div class="app">
+<?php include __DIR__ . '/includes/_sidebar.php'; ?>
+<div class="content">
+<?php include __DIR__ . '/includes/_topbar.php'; ?>
+<main class="page">
+
+<?php foreach (take_flashes() as $fl): ?>
+  <div class="alert alert-<?= $fl['type'] === 'success' ? 'success' : ($fl['type'] === 'warning' ? 'warning' : 'danger') ?>"><?= e($fl['msg']) ?></div>
+<?php endforeach; ?>
+<?php if ($errors): foreach($errors as $er): ?>
+  <div class="alert alert-danger"><?= e($er) ?></div>
+<?php endforeach; endif; ?>
+
+<!-- PAGE ACTIONS (top right) -->
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:18px">
+  <div>
+    <span style="font-size:10.5px;color:var(--muted)"><?= count($ncs) ?> NC(s) shown</span>
+    <?php if (!$isPQC && $userDept): ?>
+      <span style="margin-left:10px;font-size:10.5px;color:var(--accent)">
+        <i class="fa-solid fa-building"></i> <?= e($userDept) ?>
+      </span>
+    <?php endif; ?>
+  </div>
+  <?php if ($isPQC && $inReviewCount > 0): ?>
+    <form method="POST" onsubmit="return confirm('Verify all <?= $inReviewCount ?> in-review NC(s)?')">
+      <?= csrf_field() ?>
+      <input type="hidden" name="action" value="bulk_verify">
+      <button class="btn-verify-nc">
+        <i class="fa-solid fa-check-double"></i>
+        Verify All In-Review (<?= $inReviewCount ?>)
+      </button>
+    </form>
+  <?php endif; ?>
+</div>
+
+<!-- KPI STRIP -->
+<div class="ncrca-kpi-strip">
+  <div class="ncrca-kpi">
+    <div class="ncrca-kpi-label">Total NCs</div>
+    <div class="ncrca-kpi-val"><?= (int)($kpi['total']??0) ?></div>
+  </div>
+  <div class="ncrca-kpi">
+    <div class="ncrca-kpi-label">Open</div>
+    <div class="ncrca-kpi-val" style="color:var(--red)"><?= (int)($kpi['open_count']??0) ?></div>
+  </div>
+  <div class="ncrca-kpi">
+    <div class="ncrca-kpi-label">In Review</div>
+    <div class="ncrca-kpi-val" style="color:var(--amber)"><?= (int)($kpi['in_review']??0) ?></div>
+  </div>
+  <div class="ncrca-kpi">
+    <div class="ncrca-kpi-label">Closed</div>
+    <div class="ncrca-kpi-val" style="color:var(--green)"><?= (int)($kpi['closed_count']??0) ?></div>
+  </div>
+  <div class="ncrca-kpi">
+    <div class="ncrca-kpi-label">High Sev.</div>
+    <div class="ncrca-kpi-val" style="color:var(--red)"><?= (int)($kpi['high_sev']??0) ?></div>
+  </div>
+  <div class="ncrca-kpi">
+    <div class="ncrca-kpi-label">Overdue (&gt;7d)</div>
+    <div class="ncrca-kpi-val" style="color:var(--red)"><?= (int)($kpi['overdue']??0) ?></div>
+  </div>
+</div>
+
+<!-- STATUS TABS -->
+<div class="ncrca-tabs">
+  <?php
+  $tabs = ['open'=>'Open / In Review','closed'=>'Closed','all'=>'All'];
+  foreach ($tabs as $tv => $tl):
+    $qs = http_build_query(array_merge($_GET, ['status'=>$tv]));
+  ?>
+  <a href="?<?= $qs ?>" class="ncrca-tab <?= $fStatus===$tv?'active':'' ?>"><?= $tl ?></a>
+  <?php endforeach; ?>
+</div>
+
+<!-- LAYOUT -->
+<div class="ncrca-layout">
+
+  <!-- FILTER SIDEBAR -->
+  <aside class="ncrca-filters">
+    <h6><i class="fa-solid fa-filter"></i> Filters</h6>
+    <form method="GET" id="ncFilterForm">
+      <input type="hidden" name="status" value="<?= e($fStatus) ?>">
+      <?php if ($isPQC): ?>
+      <div class="ncrca-filter-item">
+        <label>Department</label>
+        <select name="dept" class="form-ctrl" onchange="this.form.submit()">
+          <option value="">All</option>
+          <?php foreach($DEPTS as $d): ?>
+          <option value="<?= e($d) ?>" <?= $fDept===$d?'selected':'' ?>><?= e($d) ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+      <?php endif; ?>
+      <div class="ncrca-filter-item">
+        <label>Block</label>
+        <select name="block" class="form-ctrl" onchange="this.form.submit()">
+          <option value="">All</option>
+          <?php foreach(['A','B','C','D','E'] as $b): ?>
+          <option value="<?= $b ?>" <?= $fBlock===$b?'selected':'' ?>>Block <?= $b ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+      <div class="ncrca-filter-item">
+        <label>Line</label>
+        <select name="line" class="form-ctrl" onchange="this.form.submit()">
+          <option value="">All</option>
+          <?php foreach($lines as $l): ?>
+          <option value="<?= e($l) ?>" <?= $fLine===$l?'selected':'' ?>><?= e($l) ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+      <div class="ncrca-filter-item">
+        <label>Stage</label>
+        <select name="stage" class="form-ctrl" onchange="this.form.submit()">
+          <option value="">All</option>
+          <?php foreach($stages as $s): ?>
+          <option value="<?= e($s) ?>" <?= $fStage===$s?'selected':'' ?>><?= e($s) ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+      <div class="ncrca-filter-item">
+        <label>Period</label>
+        <select name="period" class="form-ctrl" onchange="this.form.submit()">
+          <option value="">Any</option>
+          <option value="daily"   <?= $fPeriod==='daily'  ?'selected':'' ?>>Daily</option>
+          <option value="weekly"  <?= $fPeriod==='weekly' ?'selected':'' ?>>Weekly</option>
+          <option value="monthly" <?= $fPeriod==='monthly'?'selected':'' ?>>Monthly</option>
+        </select>
+      </div>
+      <div class="ncrca-filter-item">
+        <label>From</label>
+        <input type="date" name="from" class="form-ctrl" value="<?= e($fFrom) ?>" onchange="this.form.submit()">
+      </div>
+      <div class="ncrca-filter-item">
+        <label>To</label>
+        <input type="date" name="to" class="form-ctrl" value="<?= e($fTo) ?>" onchange="this.form.submit()">
+      </div>
+      <div class="ncrca-filter-item">
+        <label>Search</label>
+        <input type="text" name="q" class="form-ctrl" value="<?= e($fSearch) ?>" placeholder="NC code / param…">
+      </div>
+      <button type="submit" class="btn-primary-q" style="width:100%;margin-bottom:5px">
+        <i class="fa-solid fa-magnifying-glass"></i> Apply
+      </button>
+      <a href="nc_rca.php" style="display:block;text-align:center;font-size:11px;color:var(--muted);text-decoration:none;padding:5px">
+        Clear filters
+      </a>
+    </form>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <div>
+    <?php if (empty($ncs)): ?>
+    <div class="ncrca-empty">
+      <div><i class="fa-solid fa-clipboard-check"></i></div>
+      <div style="font-size:14px;font-weight:600;margin-bottom:5px">No NCs Found</div>
+      <div style="font-size:11.5px">
+        <?= $fStatus==='open' ? 'All NCs are resolved — great work!' : 'No records match the current filters.' ?>
+      </div>
+    </div>
+
+    <?php else: ?>
+
+    <!-- GROUPED BY STAGE -->
+    <?php foreach ($byStage as $stage => $rows): ?>
+    <div class="ncrca-stage">
+      <div class="ncrca-stage-head" onclick="toggleStage(this)">
+        <i class="fa-solid fa-layer-group" style="color:var(--accent);font-size:12px"></i>
+        <span class="ncrca-stage-name"><?= e($stage) ?></span>
+        <span class="badge-pill badge-muted" style="font-size:9.5px"><?= count($rows) ?></span>
+        <i class="fa-solid fa-chevron-down" style="font-size:10px;color:var(--muted);transition:transform .2s"></i>
+      </div>
+      <div class="ncrca-stage-body">
+      <?php foreach ($rows as $nc):
+        $ncId      = (int)$nc['id'];
+        $ncStatus  = $nc['status'];
+        $hasRCA    = !empty($nc['root_cause']) || !empty($nc['corrective_action']);
+        $rcaStatus = $nc['rca_status'] ?? null;
+        $isOverdue = ($ncStatus !== 'closed')
+                  && !empty($nc['rca_due'])
+                  && strtotime($nc['rca_due']) < time();
+        $daysOpen  = (int)floor((time() - strtotime($nc['opened_at'])) / 86400);
+        $canEdit   = ($ncStatus !== 'closed');
+        $sevCls    = 'sev-' . ($nc['severity'] ?? 'medium');
+      ?>
+      <div class="nc-row status-<?= e($ncStatus) ?>" id="nc-<?= $ncId ?>">
+
+        <!-- TOP ROW -->
+        <div class="nc-toprow">
+          <div class="nc-param"><?= e($nc['defect_type']) ?></div>
+          <?php if ($isOverdue): ?>
+            <span class="badge-pill badge-red" style="font-size:9px">OVERDUE</span>
+          <?php endif; ?>
+          <!-- Status badge -->
+          <?php
+          $stBadge = match($ncStatus) {
+              'open'      => ['badge-red',   'Open'],
+              'in_review' => ['badge-cyan',  'In Review'],
+              'closed'    => ['badge-green', 'Closed'],
+              default     => ['badge-muted', ucfirst($ncStatus)],
+          };
+          ?>
+          <span class="badge-pill <?= $stBadge[0] ?>"><?= $stBadge[1] ?></span>
+          <?php if (!empty($nc['severity'])): ?>
+          <span class="<?= $sevCls ?>" style="font-size:10px;font-weight:700"><?= ucfirst($nc['severity']) ?></span>
+          <?php endif; ?>
+        </div>
+
+        <!-- META -->
+        <div class="nc-meta">
+          <span><i class="fa-solid fa-hashtag"></i> <?= e($nc['nc_code']) ?></span>
+          <?php if (!empty($nc['audit_code'])): ?>
+          <span><i class="fa-solid fa-file-lines"></i>
+            <a href="report.php?code=<?= urlencode($nc['audit_code']) ?>" style="color:var(--accent);text-decoration:none"><?= e($nc['audit_code']) ?></a>
+          </span>
+          <?php endif; ?>
+          <span><i class="fa-solid fa-industry"></i> <?= e($nc['line']) ?></span>
+          <?php if (!empty($nc['audit_block'])): ?>
+          <span><span class="badge-pill badge-cyan" style="font-size:9px">Block <?= e($nc['audit_block']) ?></span></span>
+          <?php endif; ?>
+          <?php if (!empty($nc['model'])): ?>
+          <span><i class="fa-solid fa-cube"></i> <?= e($nc['model']) ?></span>
+          <?php endif; ?>
+          <?php if (!empty($nc['department'])): ?>
+          <span><i class="fa-solid fa-building"></i> <?= e($nc['department']) ?></span>
+          <?php endif; ?>
+          <span style="color:var(--muted)"><i class="fa-solid fa-clock"></i> <?= $daysOpen ?>d ago</span>
+          <?php if (!empty($nc['rca_due'])): ?>
+          <span style="color:<?= $isOverdue ? 'var(--red)' : 'var(--muted)' ?>">
+            <i class="fa-solid fa-calendar-xmark"></i> Due: <?= date('d M Y', strtotime($nc['rca_due'])) ?>
+          </span>
+          <?php endif; ?>
+        </div>
+
+        <!-- FINDING -->
+        <?php if (!empty($nc['ng_value']) || !empty($nc['spec'])): ?>
+        <div class="nc-finding">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <?= !empty($nc['ng_value']) ? 'Measured: <strong>' . e($nc['ng_value']) . '</strong>' : '' ?>
+          <?= !empty($nc['spec'])     ? ' &nbsp;|&nbsp; Spec: ' . e($nc['spec']) : '' ?>
+          <?= !empty($nc['ng_remark'])? ' &nbsp;|&nbsp; ' . e($nc['ng_remark']) : '' ?>
+        </div>
+        <?php endif; ?>
+
+        <!-- EXISTING RCA (read-back) -->
+        <?php if ($hasRCA): ?>
+        <div class="rca-existing">
+          <?php if (!empty($nc['root_cause'])): ?>
+          <div class="rca-existing-lbl">Root Cause</div>
+          <div style="margin-bottom:5px"><?= nl2br(e($nc['root_cause'])) ?></div>
+          <?php endif; ?>
+          <?php if (!empty($nc['corrective_action'])): ?>
+          <div class="rca-existing-lbl">Corrective Action</div>
+          <div><?= nl2br(e($nc['corrective_action'])) ?></div>
+          <?php endif; ?>
+          <?php if (!empty($nc['responsible'])): ?>
+          <div style="margin-top:5px;font-size:10.5px;color:var(--muted)">
+            <i class="fa-solid fa-user"></i> <?= e($nc['responsible']) ?>
+            <?= !empty($nc['rca_by']) ? ' &nbsp;·&nbsp; Logged by ' . e($nc['rca_by']) : '' ?>
+            <?= $rcaStatus ? ' &nbsp;·&nbsp; <span class="badge-pill badge-' . ($rcaStatus==='closed'?'green':($rcaStatus==='in_progress'?'cyan':'amber')) . '" style="font-size:9px">'.ucfirst(str_replace('_',' ',$rcaStatus)).'</span>' : '' ?>
+          </div>
+          <?php endif; ?>
+        </div>
+        <?php endif; ?>
+
+        <!-- ACTION ROW -->
+        <div style="display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin-top:8px">
+          <!-- Dept: Edit RCA -->
+          <?php if ($canEdit): ?>
+          <button type="button" class="rca-toggle <?= $ncStatus==='open'&&!$hasRCA?'':'':'' ?>"
+                  id="rca-toggle-<?= $ncId ?>"
+                  onclick="toggleRCA(<?= $ncId ?>)">
+            <i class="fa-solid <?= $hasRCA ? 'fa-pen-to-square' : 'fa-plus' ?>"></i>
+            <?= $hasRCA ? 'Edit RCA' : 'Enter RCA' ?>
+          </button>
+          <?php endif; ?>
+
+          <!-- PQC: Verify -->
+          <?php if ($isPQC && $ncStatus === 'in_review'): ?>
+          <form method="POST" style="display:inline">
+            <?= csrf_field() ?>
+            <input type="hidden" name="action"  value="verify">
+            <input type="hidden" name="nc_id"   value="<?= $ncId ?>">
+            <button type="submit" class="btn-verify-nc"
+                    onclick="return confirm('Verify and close this NC?')">
+              <i class="fa-solid fa-check-circle"></i> Verify & Close
+            </button>
+          </form>
+          <button type="button" class="btn-reopen-nc"
+                  onclick="openRejectModal(<?= $ncId ?>)">
+            <i class="fa-solid fa-rotate-left"></i> Reject / Reopen
+          </button>
+          <?php elseif ($isPQC && $ncStatus === 'closed'): ?>
+          <form method="POST" style="display:inline">
+            <?= csrf_field() ?>
+            <input type="hidden" name="action" value="reopen">
+            <input type="hidden" name="nc_id"  value="<?= $ncId ?>">
+            <button type="submit" class="btn-reopen-nc" onclick="return confirm('Reopen this NC?')" style="font-size:10.5px;padding:4px 10px">
+              <i class="fa-solid fa-arrow-rotate-left"></i> Reopen
+            </button>
+          </form>
+          <?php endif; ?>
+
+          <!-- Audit link -->
+          <?php if (!empty($nc['audit_code'])): ?>
+          <a href="report.php?code=<?= urlencode($nc['audit_code']) ?>"
+             class="btn-ghost-q" style="font-size:10.5px;padding:5px 10px">
+            <i class="fa-solid fa-arrow-up-right-from-square"></i> Audit Report
+          </a>
+          <?php endif; ?>
+        </div>
+
+        <!-- RCA FORM (accordion) -->
+        <?php if ($canEdit): ?>
+        <div class="rca-body" id="rca-body-<?= $ncId ?>">
+          <form method="POST" style="margin:0">
+            <?= csrf_field() ?>
+            <input type="hidden" name="action"  value="save_rca">
+            <input type="hidden" name="nc_id"   value="<?= $ncId ?>">
+
+            <div class="rca-grid" style="margin-bottom:10px">
+              <!-- Root Cause -->
+              <div class="rca-field" style="grid-column:1/-1">
+                <label><i class="fa-solid fa-search"></i> Root Cause *</label>
+                <textarea name="root_cause" class="form-ctrl" required
+                          placeholder="Why did this defect occur? (5-Why / Ishikawa…)"><?= e($nc['root_cause'] ?? '') ?></textarea>
+              </div>
+              <!-- Corrective Action -->
+              <div class="rca-field" style="grid-column:1/-1">
+                <label><i class="fa-solid fa-wrench"></i> Corrective Action *</label>
+                <textarea name="corrective_action" class="form-ctrl" required
+                          placeholder="What was done or will be done to prevent recurrence?"><?= e($nc['corrective_action'] ?? '') ?></textarea>
+              </div>
+              <!-- Defect Description -->
+              <div class="rca-field">
+                <label><i class="fa-solid fa-comment"></i> Defect Description</label>
+                <textarea name="defect_desc" class="form-ctrl" rows="2"
+                          placeholder="Additional details about the defect…"><?= e($nc['defect_desc'] ?? '') ?></textarea>
+              </div>
+              <!-- Responsible -->
+              <div class="rca-field">
+                <label><i class="fa-solid fa-user"></i> Responsible Person</label>
+                <input type="text" name="responsible" class="form-ctrl"
+                       value="<?= e($nc['responsible'] ?? '') ?>"
+                       placeholder="Name or GEN ID">
+              </div>
+              <!-- Period type -->
+              <div class="rca-field">
+                <label><i class="fa-solid fa-calendar"></i> Period Type</label>
+                <select name="period_type" class="form-ctrl">
+                  <?php foreach(['daily'=>'Daily','weekly'=>'Weekly','monthly'=>'Monthly'] as $v=>$l): ?>
+                  <option value="<?= $v ?>" <?= ($nc['period_type']??'daily')===$v?'selected':'' ?>><?= $l ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <!-- Period date -->
+              <div class="rca-field">
+                <label><i class="fa-solid fa-calendar-day"></i> Period Date</label>
+                <input type="date" name="period_date" class="form-ctrl" value="<?= date('Y-m-d') ?>">
+              </div>
+              <!-- Due date -->
+              <div class="rca-field">
+                <label><i class="fa-solid fa-calendar-xmark"></i> Due Date</label>
+                <input type="date" name="due_date" class="form-ctrl"
+                       value="<?= e($nc['rca_due'] ?? date('Y-m-d', strtotime('+7 days'))) ?>">
+              </div>
+              <!-- Status -->
+              <div class="rca-field">
+                <label><i class="fa-solid fa-flag"></i> Status</label>
+                <select name="rca_status" class="form-ctrl">
+                  <option value="open"        <?= ($rcaStatus??'')==='open'       ?'selected':'' ?>>Open</option>
+                  <option value="in_progress" <?= ($rcaStatus??'')==='in_progress'?'selected':'' ?>>In Progress → Submit for QA</option>
+                  <option value="closed"      <?= ($rcaStatus??'')==='closed'     ?'selected':'' ?>>Closed</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button type="submit" class="btn-primary-q">
+                <i class="fa-solid fa-floppy-disk"></i> Save RCA
+              </button>
+              <button type="button" class="btn-ghost-q" onclick="toggleRCA(<?= $ncId ?>)">
+                Cancel
+              </button>
+            </div>
+          </form>
+        </div>
+        <?php endif; // canEdit ?>
+
+      </div><!-- /nc-row -->
+      <?php endforeach; // rows ?>
+      </div><!-- /stage-body -->
+    </div><!-- /stage -->
+    <?php endforeach; // byStage ?>
+
+    <?php endif; // !empty ncs ?>
+
+  </div><!-- /main-content -->
+</div><!-- /ncrca-layout -->
+
+</main>
+</div>
+</div>
+
+<!-- REJECT MODAL -->
+<div class="ncrca-backdrop" id="rejectBackdrop" onclick="closeRejectModal()"></div>
+<div class="ncrca-modal" id="rejectModal">
+  <div style="font-weight:700;font-size:14px;margin-bottom:14px">
+    <i class="fa-solid fa-rotate-left" style="color:var(--amber)"></i> Reject / Reopen NC
+  </div>
+  <form method="POST">
+    <?= csrf_field() ?>
+    <input type="hidden" name="action"  value="reopen">
+    <input type="hidden" name="nc_id"   id="rejectNcId" value="">
+    <div style="margin-bottom:12px">
+      <label class="field-label">Reason for rejection *</label>
+      <textarea name="reject_reason" class="form-ctrl" rows="3" required
+                placeholder="Explain what needs to be corrected…"
+                style="width:100%;resize:vertical"></textarea>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button type="submit" class="btn-reopen-nc" style="flex:1">
+        <i class="fa-solid fa-paper-plane"></i> Reject & Notify
+      </button>
+      <button type="button" class="btn-ghost-q" onclick="closeRejectModal()">Cancel</button>
+    </div>
+  </form>
+</div>
+
+<?php $ASSET = ''; include __DIR__ . '/includes/_foot.php'; ?>
+
+<script>
+/* ── Toggle RCA accordion ──────────────────────────────────────── */
+function toggleRCA(id) {
+    var body   = document.getElementById('rca-body-' + id);
+    var toggle = document.getElementById('rca-toggle-' + id);
+    if (!body) return;
+    var isOpen = body.classList.contains('open');
+    body.classList.toggle('open');
+    if (toggle) toggle.classList.toggle('open', !isOpen);
+    if (!isOpen) body.scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+/* Auto-open RCA for open NCs with no RCA yet (department view only) */
+<?php if (!$isPQC): ?>
+document.querySelectorAll('.nc-row.status-open').forEach(function(row) {
+    var id = row.id.replace('nc-', '');
+    var hasRCA = row.querySelector('.rca-existing');
+    if (!hasRCA) {
+        // Don't auto-open — just highlight the toggle button
+        var btn = document.getElementById('rca-toggle-' + id);
+        if (btn) btn.style.borderColor = 'var(--red)';
+    }
+});
+<?php endif; ?>
+
+/* ── Toggle stage group ───────────────────────────────────────── */
+function toggleStage(header) {
+    var body    = header.nextElementSibling;
+    var chevron = header.querySelector('.fa-chevron-down, .fa-chevron-up');
+    body.style.display = (body.style.display === 'none') ? '' : 'none';
+    if (chevron) {
+        chevron.classList.toggle('fa-chevron-down');
+        chevron.classList.toggle('fa-chevron-up');
+    }
+}
+
+/* ── Reject modal ────────────────────────────────────────────── */
+function openRejectModal(id) {
+    document.getElementById('rejectNcId').value = id;
+    document.getElementById('rejectModal').classList.add('show');
+    document.getElementById('rejectBackdrop').classList.add('show');
+}
+function closeRejectModal() {
+    document.getElementById('rejectModal').classList.remove('show');
+    document.getElementById('rejectBackdrop').classList.remove('show');
+}
+
+/* Auto-dismiss success alerts */
+setTimeout(function() {
+    document.querySelectorAll('.alert-success').forEach(function(a) {
+        a.style.transition = 'opacity .5s';
+        a.style.opacity = '0';
+        setTimeout(function(){ a.remove(); }, 500);
+    });
+}, 4000);
+</script>
+</body>
+</html>
