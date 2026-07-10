@@ -1,0 +1,73 @@
+<?php
+// ============================================================
+//  PATCH: includes/audit_functions.php
+//  Replace the NC-creation block inside save_audit()
+//  with this version. It pulls department from audit_results
+//  and pre-populates all new RCA columns as NULL.
+// ============================================================
+
+// ── FIND this section in save_audit() and REPLACE it ──
+//
+//   // Create NC follow-ups for each NG
+//   foreach ($results as $r) { ... }
+//
+// ── WITH the block below ──
+
+function _create_nc_followups(PDO $db, array $audit, array $results, string $audit_id, string $audit_code): void
+{
+    // Remove any stale NC rows for this audit (re-save scenario)
+    $db->prepare("DELETE FROM nc_followups WHERE audit_id = ?")->execute([$audit_id]);
+
+    $stmt = $db->prepare("
+        INSERT INTO nc_followups
+            (audit_id, audit_code, line, block, model,
+             stage, param, finding, department, due_date,
+             status,
+             root_cause, corrective_action, responsible, rca_notes,
+             completion_date, rejection_reason,
+             evidence_path, evidence_name,
+             submitted_by, submitted_at, verified_by, verified_at,
+             created_at)
+        VALUES
+            (:audit_id, :audit_code, :line, :block, :model,
+             :stage, :param, :finding, :department, :due_date,
+             'pending',
+             NULL, NULL, NULL, NULL,
+             NULL, NULL,
+             NULL, NULL,
+             NULL, NULL, NULL, NULL,
+             NOW())
+    ");
+
+    foreach ($results as $r) {
+        if (($r['result'] ?? '') !== 'NG') continue;
+
+        $dept     = !empty($r['department']) ? $r['department'] : 'Quality';
+        $finding  = "Value: " . ($r['value'] ?? 'N/A') . " | Spec: " . ($r['spec'] ?? 'N/A');
+        $due_date = date('Y-m-d', strtotime('+7 days'));
+
+        $stmt->execute([
+            ':audit_id'   => $audit_id,
+            ':audit_code' => $audit_code,
+            ':line'       => $audit['line']  ?? '',
+            ':block'      => $audit['block'] ?? (function() use ($audit) {
+                                return function_exists('block_for_line')
+                                    ? block_for_line($audit['line'] ?? '')
+                                    : '';
+                             })(),
+            ':model'      => $audit['model'] ?? '',
+            ':stage'      => $r['stage']     ?? '',
+            ':param'      => $r['param']     ?? '',
+            ':finding'    => $finding,
+            ':department' => $dept,
+            ':due_date'   => $due_date,
+        ]);
+    }
+}
+
+// ── Also update save_audit() to CALL _create_nc_followups() ──
+// At the END of save_audit(), after $db->commit(), add:
+//
+//   _create_nc_followups($db, $audit, $results, (string)$audit_id, $audit_code);
+//
+// Remove any previous NC-creation loop that was inline in save_audit().
