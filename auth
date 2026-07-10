@@ -1,0 +1,94 @@
+<?php
+/* ============================================================================
+ *  includes/auth.php  —  session-based authentication & role gate
+ *  ---------------------------------------------------------------------------
+ *  Standalone replacement for the auth.php referenced by the original
+ *  audit.php. Provides: login(), logout(), currentUser(), requireLogin(),
+ *  requireAdmin(), can_admin(), can_audit().
+ * ==========================================================================*/
+
+require_once __DIR__ . '/../config/db.php';
+
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+/* Attempt login with email + password. Returns true on success. */
+function login(string $gen_id, string $password): bool
+{
+    $st = db()->prepare("
+        SELECT u.id, u.gen_id, u.name, u.password_hash, u.status,
+               r.name AS role, r.label AS role_label, r.can_admin, r.can_audit
+        FROM users u LEFT JOIN roles r ON r.id = u.role_id
+        WHERE u.gen_id = ? LIMIT 1
+    ");
+    $st->execute([$gen_id]);
+    $u = $st->fetch();
+
+    if (!$u || $u['status'] !== 'active' || !password_verify($password, $u['password_hash'])) {
+        return false;
+    }
+    unset($u['password_hash']);
+    $_SESSION['user'] = $u;
+
+    db()->prepare("UPDATE users SET last_login = NOW() WHERE id = ?")->execute([$u['id']]);
+    return true;
+}
+
+/* Determine redirect target after login based on role/admin flag.
+   PQC / Admin → dashboard.php
+   Department heads without can_admin → nc_rca.php (their NC queue) */
+function post_login_redirect(array $user): string
+{
+    // Roles / dept labels that are PQC / QA (can see dashboard directly)
+    $pqcLabels = ['administrator','quality manager','pqc','quality','admin','auditor'];
+    $roleLabel = strtolower($user['role_label'] ?? '');
+
+    if (!empty($user['can_admin'])) return 'dashboard.php';
+    if (!empty($user['can_audit'])) return 'dashboard.php';
+    // Non-auditor, non-admin dept users go to their NC queue
+    return 'nc_rca.php';
+}
+
+
+function logout(): void
+{
+    $_SESSION = [];
+    if (session_status() === PHP_SESSION_ACTIVE) session_destroy();
+}
+
+/* The logged-in user array (or null). Mirrors $u used by audit.php. */
+function currentUser(): ?array
+{
+    return $_SESSION['user'] ?? null;
+}
+
+/* Redirect to login if not authenticated. */
+function requireLogin(): void
+{
+    if (!currentUser()) {
+        header('Location: ' . base_path() . 'login.php');
+        exit;
+    }
+}
+
+/* Redirect to dashboard if the user has no admin rights. */
+function requireAdmin(): void
+{
+    requireLogin();
+    if (empty(currentUser()['can_admin'])) {
+        header('Location: ' . base_path() . 'dashboard.php');
+        exit;
+    }
+}
+
+function can_admin(): bool { return !empty(currentUser()['can_admin']); }
+function can_audit(): bool { return !empty(currentUser()['can_audit']); }
+
+/* Resolve the app root URL prefix so links work from / and /admin alike. */
+function base_path(): string
+{
+    // depth of the current script relative to the project root
+    $dir = str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? ''));
+    return (basename($dir) === 'admin') ? '../' : '';
+}
