@@ -1,0 +1,37 @@
+<?php
+// ============================================================
+//  PATCH: includes/_sidebar.php
+//
+//  FIND the two separate nav entries for NC Follow-up and RCA:
+//
+//    ['label'=>'NC Follow-up', 'url'=>'nc_followup.php', ...],
+//    ['label'=>'RCA',          'url'=>'rca.php',         ...],
+//
+//  REPLACE both with the single merged entry below.
+//  Also add it to $ADMIN_NAV if it appears there.
+// ============================================================
+
+// ── In your $NAV array, replace the two separate items with: ──
+
+$NAV = [
+    // ... existing items above ...
+
+    [
+        'label'  => 'Follow-up & RCA',
+        'url'    => 'followup.php',
+        'icon'   => 'fa-tasks',          // Font Awesome 6 icon name
+        'active' => in_array(basename($_SERVER['PHP_SELF']), [
+                        'followup.php',
+                        'nc_followup.php',   // keep old URL redirecting
+                        'rca.php',           // keep old URL redirecting
+                    ], true),
+    ],
+
+    // ... existing items below ...
+];
+
+// ── Also add redirect shims so old bookmarked URLs still work ──
+// Create  nc_followup.php  containing:
+//   <?php header('Location: followup.php'); exit;
+// Create  rca.php  containing:
+//   <?php header('Location: followup.php'); exit;
