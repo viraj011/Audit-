@@ -1,0 +1,64 @@
+<?php
+/* ============================================================================
+ *  login.php — sign in. Verifies against the users table via auth.php.
+ * ==========================================================================*/
+require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/helpers.php';
+
+if (currentUser()) { 
+    $dest = function_exists('post_login_redirect') ? post_login_redirect(currentUser()) : 'dashboard.php';
+    header('Location: ' . $dest); exit;
+}
+
+$error = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!csrf_check()) {
+        $error = 'Session expired — please try again.';
+    } else {
+        $gen_id = trim($_POST['gen_id'] ?? '');
+        $pass  = $_POST['password'] ?? '';
+        if (login($gen_id, $pass)) {
+            $dest = function_exists('post_login_redirect') ? post_login_redirect(currentUser()) : 'dashboard.php';
+            header('Location: ' . $dest); exit;
+        }
+        $error = 'Invalid GEN ID or password.';
+    }
+}
+$PAGE_TITLE = 'Sign in';
+$ASSET = '';
+include __DIR__ . '/includes/_head.php';
+?>
+<div class="auth-wrap">
+  <div class="auth-card">
+    <div class="auth-brand">
+      <div class="brand-mark"><i class="fa-solid fa-shield-halved"></i></div>
+      <div><strong>QATS</strong><span>Quality Audit Tracking System</span></div>
+    </div>
+    <h1 class="auth-title">Welcome back</h1>
+    <p class="auth-sub">Sign in to your quality dashboard.</p>
+
+    <?php if ($error): ?><div class="alert alert-danger"><?= htmlspecialchars($error) ?></div><?php endif; ?>
+
+    <form method="post" novalidate>
+      <?= csrf_field() ?>
+      <label class="field-label">Gen.ID</label>
+      <div class="field"><i class="fa-solid fa-envelope"></i>
+        <input type="text" name="gen_id" required autofocus placeholder="Enter Gen.ID"
+               value="<?= htmlspecialchars($_POST['gen_id'] ?? '') ?>">
+      </div>
+      <label class="field-label">Password</label>
+      <div class="field"><i class="fa-solid fa-lock"></i>
+        <input type="password" name="password" required placeholder="••••••••" id="pw">
+        <button type="button" class="pw-toggle" onclick="const p=document.getElementById('pw');p.type=p.type==='password'?'text':'password';this.querySelector('i').classList.toggle('fa-eye');this.querySelector('i').classList.toggle('fa-eye-slash');"><i class="fa-solid fa-eye" style="margin-left: -15px;"></i></button>
+      </div>
+      <button type="submit" class="btn-primary-q">Sign in <i class="fa-solid fa-arrow-right"></i></button>
+    </form>
+  </div>
+  <div class="auth-aside">
+    <div class="auth-aside-inner">
+      <h2>Track quality.<br>Predict risk.<br>Act faster.</h2>
+      <p>Real-time audit analytics, predictive risk forecasting .</p>
+    </div>
+  </div>
+</div>
+<?php $ASSET=''; include __DIR__ . '/includes/_foot.php'; ?>
