@@ -1,0 +1,77 @@
+<?php
+/* includes/_sidebar.php — left navigation. Links are real pages; the Admin
+   group only appears for users whose role has can_admin. $ASSET = root prefix. */
+$ASSET  = $ASSET ?? '';
+$ACTIVE = $ACTIVE ?? 'dashboard';
+$me     = function_exists('currentUser') ? currentUser() : null;
+
+// [key, label, icon, href]
+$NAV = [
+  ['dashboard',   'Dashboard',            'fa-gauge-high',          $ASSET.'dashboard.php'],
+  ['audit',       'Manual Audit',         'fa-clipboard-check',     $ASSET.'audit.php'],
+  ['auto',        'Auto Audit',           'fa-robot',               $ASSET.'audit.php?mode=auto'],
+  ['audits',      'Audit Records',        'fa-table-list',          $ASSET.'audits.php'],
+  ['followup',    'Follow-up Audits',     'fa-rotate-right',        $ASSET.'followup.php'],
+  ['auditor_history', 'Auditor History',  'fa-user-clock',          $ASSET.'auditor_history.php'],
+  ['nc_rca',      'NC Follow-up & RCA',   'fa-microscope',          $ASSET.'nc_rca.php'],
+  ['analytics',   'Analytics',            'fa-chart-pie',           $ASSET.'analytics.php'],
+  ['prediction',  'Prediction Dashboard', 'fa-brain',               $ASSET.'predictivedashboard.php'],
+];
+$ADMIN_NAV = [
+  ['admin',       'Admin Home',           'fa-shield-halved', $ASSET.'admin/index.php'],
+  ['admin_users', 'Users',                'fa-users',         $ASSET.'admin/users.php'],
+  ['admin_roles', 'Roles',                'fa-user-shield',   $ASSET.'admin/roles.php'],
+  ['admin_params','Parameters',           'fa-sliders',       $ASSET.'admin/parameters.php'],
+  ['admin_lines', 'Production Lines',     'fa-industry',      $ASSET.'admin/lines.php'],
+  ['admin_models','Models',               'fa-boxes-stacked', $ASSET.'admin/models.php'],
+  ['admin_nc',    'Nonconformities',      'fa-triangle-exclamation', $ASSET.'admin/nonconformities.php'],
+  ['admin_capa',  'CAPA Actions',         'fa-clipboard-list',$ASSET.'admin/capa.php'],
+  ['audit_edit',  'Edit / Delete Audits', 'fa-pen-to-square', $ASSET.'audit_edit.php'],
+];
+$QUICK = [
+  ['New Manual Audit', 'fa-clipboard-check', $ASSET.'audit.php'],
+  ['New Auto Audit',   'fa-robot',           $ASSET.'audit.php?mode=auto'],
+  ['New Action / NC',  'fa-triangle-exclamation', $ASSET.'admin/nonconformities.php'],
+  ['Add Standard',     'fa-plus',            $ASSET.'admin/parameters.php'],
+];
+
+$initials = $me ? strtoupper(substr($me['name'],0,1) . (strpos($me['name'],' ')!==false ? substr($me['name'], strpos($me['name'],' ')+1, 1) : '')) : 'QA';
+?>
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-brand">
+    <div class="brand-mark"><i class="fa-solid fa-shield-halved"></i></div>
+    <div class="brand-text"><strong>QATS</strong><small>Quality Audit &amp;<br>Tracking System</small></div>
+  </div>
+
+  <nav class="sidebar-nav">
+    <?php foreach ($NAV as $n): ?>
+      <a class="nav-item <?= $ACTIVE === $n[0] ? 'active' : '' ?>" href="<?= htmlspecialchars($n[3]) ?>">
+        <i class="fa-solid <?= $n[2] ?>"></i> <?= htmlspecialchars($n[1]) ?>
+        <?php if (!empty($n[4])): ?><i class="nav-badge"><?= (int)$n[4] ?></i><?php endif; ?>
+      </a>
+    <?php endforeach; ?>
+
+    <?php if (!$me || !empty($me['can_admin'])): ?>
+      <div class="nav-group-label">Administration</div>
+      <?php foreach ($ADMIN_NAV as $n): ?>
+        <a class="nav-item <?= $ACTIVE === $n[0] ? 'active' : '' ?>" href="<?= htmlspecialchars($n[3]) ?>">
+          <i class="fa-solid <?= $n[2] ?>"></i> <?= htmlspecialchars($n[1]) ?>
+        </a>
+      <?php endforeach; ?>
+    <?php endif; ?>
+  </nav>
+
+  <div class="quick-actions">
+    <div class="quick-head"><span>Quick Actions</span><span class="quick-live"><span class="live-dot"></span>Live</span></div>
+    <?php foreach ($QUICK as $q): ?>
+      <a class="quick-btn" href="<?= htmlspecialchars($q[2]) ?>"><i class="fa-solid <?= $q[1] ?>"></i> <?= htmlspecialchars($q[0]) ?></a>
+    <?php endforeach; ?>
+  </div>
+
+  <div class="sidebar-user">
+    <div class="avatar"><?= htmlspecialchars($initials) ?></div>
+    <div><strong><?= htmlspecialchars($me['name'] ?? 'Guest') ?></strong><small><?= htmlspecialchars($me['role_label'] ?? 'Not signed in') ?></small></div>
+    <a href="<?= $ASSET ?>logout.php" title="Log out" style="margin-left:auto;color:var(--muted)"><i class="fa-solid fa-arrow-right-from-bracket"></i></a>
+  </div>
+</aside>
+<div class="sidebar-scrim" id="scrim"></div>
