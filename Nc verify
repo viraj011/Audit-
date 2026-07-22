@@ -1,0 +1,751 @@
+<?php
+/* ============================================================================
+ *  nc_verify.php — QA / PQC Verification Queue
+ *  ---------------------------------------------------------------------------
+ *  Dedicated page showing every NC in 'in_review' status.
+ *  Features:
+ *    - Full RCA submitted by department is shown before verify/reject
+ *    - Auditor who raised the NG is traced (audits.gen_id + audits.operator)
+ *    - Single verify, single reject (with reason modal), bulk verify (checkboxes)
+ *    - Verify All button for closing everything at once
+ *    - Grouped by department, filterable by dept/block/line/stage
+ *    - PQC/Admin only — others redirected to nc_rca.php
+ * ===========================================================================*/
+require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/helpers.php';
+require_once __DIR__ . '/includes/components.php';
+require_once __DIR__ . '/includes/audit_functions.php';
+requireLogin();
+
+$db = db();
+$me = currentUser();
+$by = $me['name'] ?? $me['gen_id'] ?? 'QA';
+
+/* ── PQC/Admin gate ──────────────────────────────────────────────────────── */
+$userRole = strtolower($me['role'] ?? '');
+$userDept = $me['department'] ?? '';
+/* Also fall back to role_label department detection for old sessions */
+if ($userDept === '') {
+    $DEPTS = ['Production','Material','Maintenance','Programming','Quality'];
+    foreach ($DEPTS as $d) {
+        if (stripos($me['role_label'] ?? '', $d) !== false) { $userDept = $d; break; }
+    }
+}
+$isPQC = !empty($me['can_admin'])
+      || in_array($userRole, ['admin','pqc','quality','quality manager'], true)
+      || in_array(strtolower($userDept), ['pqc','quality','qa'], true);
+
+if (!$isPQC) {
+    flash('Access denied — verification is for QA / PQC only.', 'error');
+    header('Location: nc_rca.php');
+    exit;
+}
+
+/* ── POST handlers ───────────────────────────────────────────────────────── */
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!csrf_check()) {
+        flash('Session expired.', 'error');
+        header('Location: nc_verify.php');
+        exit;
+    }
+
+    $action = $_POST['action'] ?? '';
+
+    /* ── Single verify ─────────────────────────────────────────────────── */
+    if ($action === 'verify') {
+        $ncId = (int)($_POST['nc_id'] ?? 0);
+        if ($ncId > 0) {
+            $db->prepare("UPDATE nonconformities SET status='closed', closed_at=NOW() WHERE id=?")
+               ->execute([$ncId]);
+            $row = $db->prepare(
+                "SELECT n.stage, n.defect_type, a.audit_code
+                 FROM nonconformities n
+                 LEFT JOIN audits a ON a.id = n.audit_id
+                 WHERE n.id = ? LIMIT 1");
+            $row->execute([$ncId]);
+            $row = $row->fetch();
+            if ($row) {
+                $db->prepare("UPDATE rca_entries SET status='closed'
+                              WHERE audit_code=? AND stage=? AND param=?")
+                   ->execute([$row['audit_code']??null, $row['stage'], $row['defect_type']]);
+            }
+            flash("NC #{$ncId} verified and closed.", 'success');
+        }
+        $qs = $_SERVER['QUERY_STRING'] ? '?' . $_SERVER['QUERY_STRING'] : '';
+        header('Location: nc_verify.php' . $qs);
+        exit;
+    }
+
+    /* ── Single reject ─────────────────────────────────────────────────── */
+    if ($action === 'reject') {
+        $ncId  = (int)($_POST['nc_id'] ?? 0);
+        $reason = trim($_POST['reject_reason'] ?? '');
+        if ($ncId > 0) {
+            $db->prepare("UPDATE nonconformities SET status='open', closed_at=NULL WHERE id=?")
+               ->execute([$ncId]);
+            $row = $db->prepare(
+                "SELECT n.stage, n.defect_type, a.audit_code
+                 FROM nonconformities n
+                 LEFT JOIN audits a ON a.id = n.audit_id
+                 WHERE n.id = ? LIMIT 1");
+            $row->execute([$ncId]);
+            $row = $row->fetch();
+            if ($row) {
+                $note = ' [QA Rejected by ' . $by . ': ' . mb_substr($reason, 0, 200) . ']';
+                $db->prepare(
+                    "UPDATE rca_entries
+                     SET status='open',
+                         responsible = CONCAT(COALESCE(responsible,''), ?)
+                     WHERE audit_code=? AND stage=? AND param=?")
+                   ->execute([$note, $row['audit_code']??null, $row['stage'], $row['defect_type']]);
+            }
+            flash("NC #{$ncId} rejected — sent back to department.", 'warning');
+        }
+        $qs = $_SERVER['QUERY_STRING'] ? '?' . $_SERVER['QUERY_STRING'] : '';
+        header('Location: nc_verify.php' . $qs);
+        exit;
+    }
+
+    /* ── Bulk verify selected ──────────────────────────────────────────── */
+    if ($action === 'bulk_verify') {
+        $ids = array_filter(array_map('intval', (array)($_POST['nc_ids'] ?? [])));
+        if ($ids) {
+            $ph = implode(',', array_fill(0, count($ids), '?'));
+            $db->prepare("UPDATE nonconformities SET status='closed', closed_at=NOW() WHERE id IN ($ph)")
+               ->execute(array_values($ids));
+            foreach ($ids as $id) {
+                $row = $db->prepare(
+                    "SELECT n.stage, n.defect_type, a.audit_code
+                     FROM nonconformities n LEFT JOIN audits a ON a.id=n.audit_id
+                     WHERE n.id=? LIMIT 1");
+                $row->execute([$id]);
+                $row = $row->fetch();
+                if ($row) {
+                    $db->prepare("UPDATE rca_entries SET status='closed'
+                                  WHERE audit_code=? AND stage=? AND param=?")
+                       ->execute([$row['audit_code']??null, $row['stage'], $row['defect_type']]);
+                }
+            }
+            flash(count($ids) . ' NC(s) verified and closed.', 'success');
+        }
+        header('Location: nc_verify.php');
+        exit;
+    }
+
+    /* ── Verify ALL in_review ──────────────────────────────────────────── */
+    if ($action === 'verify_all') {
+        $db->exec("UPDATE nonconformities SET status='closed', closed_at=NOW() WHERE status='in_review'");
+        $db->exec("UPDATE rca_entries SET status='closed' WHERE status='in_progress'");
+        flash('All submitted NCs verified and closed.', 'success');
+        header('Location: nc_verify.php');
+        exit;
+    }
+}
+
+/* ── Filters ─────────────────────────────────────────────────────────────── */
+$fDept  = trim($_GET['dept']  ?? '');
+$fLine  = trim($_GET['line']  ?? '');
+$fBlock = trim($_GET['block'] ?? '');
+$fStage = trim($_GET['stage'] ?? '');
+
+/* ── Main query: all in_review NCs + RCA + auditor trace ─────────────────── */
+$where  = ["n.status = 'in_review'"];
+$params = [];
+if ($fDept) {
+    $where[] = "EXISTS (SELECT 1 FROM audit_results ar2
+                        WHERE ar2.audit_id=n.audit_id AND ar2.stage=n.stage
+                          AND ar2.result='NG' AND ar2.department=?)";
+    $params[] = $fDept;
+}
+if ($fLine)  { $where[] = 'n.line = ?';  $params[] = $fLine; }
+if ($fBlock) { $where[] = 'a.block = ?'; $params[] = $fBlock; }
+if ($fStage) { $where[] = 'n.stage = ?'; $params[] = $fStage; }
+
+$wSQL = implode(' AND ', $where);
+
+/* Primary query with correlated subquery for audit_results (no ORDER BY in JOIN ON) */
+$ncs = [];
+try {
+    $st = $db->prepare("
+        SELECT
+            n.*,
+            a.audit_code,
+            a.gen_id   AS auditor_gen_id,
+            a.operator AS auditor_name,
+            a.model, a.shift, a.block AS audit_block,
+            a.created_at AS audit_date,
+            ar.department, ar.remark AS ng_remark, ar.spec, ar.value AS ng_value,
+            r.id               AS rca_id,
+            r.root_cause,
+            r.corrective_action,
+            r.responsible,
+            r.defect_desc,
+            r.due_date         AS rca_due,
+            r.period_type,
+            r.created_by       AS rca_submitted_by
+        FROM nonconformities n
+        LEFT JOIN audits a ON a.id = n.audit_id
+        LEFT JOIN audit_results ar ON ar.id = (
+            SELECT ar2.id FROM audit_results ar2
+            WHERE ar2.audit_id = n.audit_id
+              AND ar2.stage    = n.stage
+              AND ar2.result   = 'NG'
+            ORDER BY ar2.id ASC LIMIT 1
+        )
+        LEFT JOIN (
+            SELECT re.*,
+                   ROW_NUMBER() OVER
+                       (PARTITION BY re.audit_code, re.stage, re.param
+                        ORDER BY re.id DESC) AS rn
+            FROM rca_entries re
+        ) r ON r.audit_code = a.audit_code
+            AND r.stage = n.stage
+            AND r.param = n.defect_type
+            AND r.rn = 1
+        WHERE $wSQL
+        ORDER BY n.opened_at ASC
+    ");
+    $st->execute($params);
+    $ncs = $st->fetchAll();
+} catch (Throwable $e) {
+    /* MySQL < 8 fallback — no ROW_NUMBER */
+    try {
+        $st2 = $db->prepare("
+            SELECT n.*,
+                   a.audit_code, a.gen_id AS auditor_gen_id, a.operator AS auditor_name,
+                   a.model, a.shift, a.block AS audit_block, a.created_at AS audit_date,
+                   ar.department, ar.remark AS ng_remark, ar.spec, ar.value AS ng_value
+            FROM nonconformities n
+            LEFT JOIN audits a ON a.id = n.audit_id
+            LEFT JOIN audit_results ar ON ar.id = (
+                SELECT ar2.id FROM audit_results ar2
+                WHERE ar2.audit_id = n.audit_id AND ar2.stage = n.stage AND ar2.result = 'NG'
+                ORDER BY ar2.id ASC LIMIT 1
+            )
+            WHERE $wSQL ORDER BY n.opened_at ASC
+        ");
+        $st2->execute($params);
+        $ncs = $st2->fetchAll();
+        /* Attach RCA manually */
+        $rcaSt = $db->prepare(
+            "SELECT * FROM rca_entries
+             WHERE audit_code=? AND stage=? AND param=?
+             ORDER BY id DESC LIMIT 1");
+        foreach ($ncs as &$row) {
+            try {
+                $rcaSt->execute([$row['audit_code']??null, $row['stage'], $row['defect_type']]);
+                $rca = $rcaSt->fetch();
+                if ($rca) {
+                    $row['rca_id']           = $rca['id'];
+                    $row['root_cause']       = $rca['root_cause'];
+                    $row['corrective_action']= $rca['corrective_action'];
+                    $row['responsible']      = $rca['responsible'];
+                    $row['defect_desc']      = $rca['defect_desc'];
+                    $row['rca_due']          = $rca['due_date'];
+                    $row['period_type']      = $rca['period_type'];
+                    $row['rca_submitted_by'] = $rca['created_by'];
+                }
+            } catch (Throwable $e2) {}
+        }
+        unset($row);
+    } catch (Throwable $e3) {}
+}
+
+/* ── KPI ─────────────────────────────────────────────────────────────────── */
+try {
+    $kpi = $db->query("
+        SELECT
+            COUNT(*)                               AS in_review,
+            SUM(severity IN ('high','critical'))   AS high_sev,
+            COUNT(DISTINCT n.line)                 AS lines_affected,
+            COUNT(DISTINCT ar2.department)         AS depts_affected
+        FROM nonconformities n
+        LEFT JOIN audit_results ar2
+               ON ar2.audit_id=n.audit_id AND ar2.stage=n.stage AND ar2.result='NG'
+        WHERE n.status='in_review'
+    ")->fetch();
+} catch (Throwable $e) {
+    $kpi = ['in_review'=>0,'high_sev'=>0,'lines_affected'=>0,'depts_affected'=>0];
+}
+
+/* ── Group by dept ───────────────────────────────────────────────────────── */
+$grouped = [];
+foreach ($ncs as $nc) {
+    $dept = $nc['department'] ?: 'Unassigned';
+    $grouped[$dept][] = $nc;
+}
+ksort($grouped);
+
+/* ── Filter options ──────────────────────────────────────────────────────── */
+$DEPTS     = ['Production','Material','Maintenance','Programming','Quality'];
+$lineOpts  = [];
+try { $lineOpts  = $db->query("SELECT name FROM production_lines WHERE active=1 ORDER BY sort_order,name")->fetchAll(PDO::FETCH_COLUMN); } catch(Throwable $e){}
+$stageOpts = [];
+try { $stageOpts = $db->query("SELECT DISTINCT stage FROM nonconformities WHERE stage IS NOT NULL ORDER BY stage")->fetchAll(PDO::FETCH_COLUMN); } catch(Throwable $e){}
+
+$PAGE_TITLE   = 'QA Verification Queue';
+$PAGE_HEADING = 'Verification Queue';
+$PAGE_SUB     = 'Review RCA submissions and verify or reject each NC — QA / PQC only';
+$ACTIVE       = 'nc_rca';
+$ASSET        = '';
+include __DIR__ . '/includes/_head.php';
+?>
+<style>
+/* ── nc_verify scoped styles ─────────────────────────────────────────────── */
+.vq-kpi-strip{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+.vq-kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:13px 15px;text-align:center}
+.vq-kpi-lbl{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
+.vq-kpi-val{font-size:26px;font-weight:800;line-height:1}
+
+.vq-filter-bar{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;
+  padding:11px 14px;background:var(--card);border:1px solid var(--border);
+  border-radius:9px;margin-bottom:16px}
+.vq-filter-bar label{font-size:9.5px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);display:block;margin-bottom:3px}
+.vq-filter-bar select{background:var(--card-2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 9px;font-size:11px;outline:none}
+.vq-filter-bar select:focus{border-color:var(--accent)}
+.vq-apply{background:var(--accent);color:#000;border:none;border-radius:6px;padding:6px 14px;font-size:11px;font-weight:700;cursor:pointer}
+
+.vq-dept-head{display:flex;align-items:center;gap:10px;padding:10px 14px;
+  background:var(--card-2);border:1px solid var(--border);border-radius:8px 8px 0 0;
+  cursor:pointer;user-select:none;margin-top:18px}
+.vq-dept-name{font-weight:700;font-size:13px;flex:1}
+.vq-dept-body{border:1px solid var(--border);border-top:none;border-radius:0 0 8px 8px;overflow:hidden}
+
+.vq-card{padding:16px 18px;border-bottom:1px solid var(--border);
+  background:var(--card);border-left:3px solid var(--amber);transition:background .12s}
+.vq-card:last-child{border-bottom:none;border-radius:0 0 8px 8px}
+.vq-card:hover{background:var(--raised)}
+
+.vq-card-top{display:flex;align-items:flex-start;gap:10px;margin-bottom:8px}
+.vq-param{font-weight:700;font-size:13px;flex:1}
+.vq-meta{display:flex;flex-wrap:wrap;gap:12px;font-size:10.5px;color:var(--muted);margin-bottom:9px}
+
+/* Auditor trace */
+.vq-auditor-trace{background:rgba(0,212,255,.06);border:1px solid rgba(0,212,255,.18);
+  border-radius:6px;padding:7px 12px;font-size:10.5px;color:var(--muted);
+  margin-bottom:9px;display:flex;align-items:center;gap:9px}
+.vq-auditor-trace i{color:var(--accent);font-size:13px}
+.vq-auditor-trace strong{color:var(--text)}
+
+.vq-finding{background:rgba(255,71,87,.07);border:1px solid rgba(255,71,87,.2);
+  border-radius:6px;padding:7px 12px;font-size:11px;color:#ff8090;margin-bottom:10px}
+
+.vq-rca-box{background:rgba(0,212,255,.05);border:1px solid rgba(0,212,255,.15);
+  border-radius:8px;padding:13px 15px;margin-bottom:12px}
+.vq-rca-head{font-size:9.5px;text-transform:uppercase;letter-spacing:.09em;
+  color:var(--accent);font-weight:700;margin-bottom:9px;display:flex;align-items:center;gap:7px}
+.vq-rca-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.vq-rca-lbl{font-size:9px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:3px}
+.vq-rca-val{font-size:11.5px;color:var(--text)}
+.vq-rca-val.missing{color:var(--red);font-style:italic}
+
+.vq-no-rca{background:rgba(255,71,87,.08);border:1px solid rgba(255,71,87,.2);
+  border-radius:6px;padding:8px 12px;font-size:11px;color:var(--red);margin-bottom:10px}
+
+.vq-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.btn-vq-verify{background:rgba(0,229,160,.12);border:1px solid rgba(0,229,160,.35);
+  color:var(--green);border-radius:7px;padding:6px 16px;font-size:11.5px;
+  font-weight:700;cursor:pointer;transition:all .18s}
+.btn-vq-verify:hover{background:rgba(0,229,160,.25)}
+.btn-vq-reject{background:rgba(255,179,64,.1);border:1px solid rgba(255,179,64,.3);
+  color:var(--amber);border-radius:7px;padding:6px 16px;font-size:11.5px;
+  cursor:pointer;transition:all .18s}
+.btn-vq-reject:hover{background:rgba(255,179,64,.22)}
+
+.vq-cb{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;flex-shrink:0}
+.vq-bulk-bar{background:rgba(0,212,255,.07);border:1px solid rgba(0,212,255,.18);
+  border-radius:9px;padding:11px 16px;margin-bottom:14px;
+  display:flex;align-items:center;gap:14px;font-size:11.5px}
+
+.vq-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:1040}
+.vq-backdrop.show{display:block}
+.vq-modal{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+  width:440px;max-width:95vw;background:var(--card);border:1px solid var(--border-2);
+  border-radius:12px;padding:22px;z-index:1050;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.vq-modal.show{display:block}
+
+.vq-empty{text-align:center;padding:56px 20px;color:var(--muted)}
+.vq-empty i{font-size:42px;opacity:.3;display:block;margin-bottom:12px}
+
+@media(max-width:860px){
+  .vq-kpi-strip{grid-template-columns:repeat(2,1fr)}
+  .vq-rca-grid{grid-template-columns:1fr}
+  .vq-filter-bar{flex-direction:column}
+}
+</style>
+
+<div class="app">
+  <?php include __DIR__ . '/includes/_sidebar.php'; ?>
+  <div class="content">
+    <?php include __DIR__ . '/includes/_topbar.php'; ?>
+    <main class="page">
+
+<?php foreach (take_flashes() as $fl):
+    $cls = match($fl['type']){'success'=>'success','warning'=>'warning',default=>'danger'};
+?>
+<div class="alert alert-<?= $cls ?>"><?= e($fl['msg']) ?></div>
+<?php endforeach; ?>
+
+<!-- PAGE HEADER -->
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px">
+  <div style="font-size:10.5px;color:var(--muted)">
+    <i class="fa-solid fa-shield-halved" style="color:var(--accent)"></i>
+    PQC / QA ONLY &nbsp;·&nbsp; <?= count($ncs) ?> NC(s) awaiting verification
+  </div>
+  <div style="display:flex;gap:8px">
+    <a href="nc_rca.php" class="btn-ghost-q" style="font-size:11px">
+      <i class="fa-solid fa-arrow-left"></i> Back to Follow-up
+    </a>
+    <?php if (!empty($ncs)): ?>
+    <form method="POST" onsubmit="return confirm('Verify ALL <?= count($ncs) ?> NC(s) in the current view?')">
+      <?= csrf_field() ?>
+      <input type="hidden" name="action" value="verify_all">
+      <button class="btn-primary-q" style="font-size:11px">
+        <i class="fa-solid fa-check-double"></i> Verify All (<?= count($ncs) ?>)
+      </button>
+    </form>
+    <?php endif; ?>
+  </div>
+</div>
+
+<!-- KPI -->
+<div class="vq-kpi-strip">
+  <div class="vq-kpi">
+    <div class="vq-kpi-lbl">Awaiting Verification</div>
+    <div class="vq-kpi-val" style="color:var(--amber)"><?= (int)($kpi['in_review']??0) ?></div>
+  </div>
+  <div class="vq-kpi">
+    <div class="vq-kpi-lbl">High / Critical</div>
+    <div class="vq-kpi-val" style="color:var(--red)"><?= (int)($kpi['high_sev']??0) ?></div>
+  </div>
+  <div class="vq-kpi">
+    <div class="vq-kpi-lbl">Lines Affected</div>
+    <div class="vq-kpi-val" style="color:var(--accent)"><?= (int)($kpi['lines_affected']??0) ?></div>
+  </div>
+  <div class="vq-kpi">
+    <div class="vq-kpi-lbl">Departments</div>
+    <div class="vq-kpi-val" style="color:var(--purple)"><?= (int)($kpi['depts_affected']??0) ?></div>
+  </div>
+</div>
+
+<!-- FILTER BAR -->
+<form method="GET" class="vq-filter-bar">
+  <div>
+    <label>Department</label>
+    <select name="dept" onchange="this.form.submit()">
+      <option value="">All</option>
+      <?php foreach ($DEPTS as $d): ?>
+      <option value="<?= e($d) ?>" <?= $fDept===$d?'selected':'' ?>><?= e($d) ?></option>
+      <?php endforeach; ?>
+    </select>
+  </div>
+  <div>
+    <label>Block</label>
+    <select name="block" onchange="this.form.submit()">
+      <option value="">All</option>
+      <?php foreach(['A','B','C','D','E'] as $b): ?>
+      <option value="<?= $b ?>" <?= $fBlock===$b?'selected':'' ?>>Block <?= $b ?></option>
+      <?php endforeach; ?>
+    </select>
+  </div>
+  <div>
+    <label>Line</label>
+    <select name="line" onchange="this.form.submit()">
+      <option value="">All</option>
+      <?php foreach($lineOpts as $l): ?>
+      <option value="<?= e($l) ?>" <?= $fLine===$l?'selected':'' ?>><?= e($l) ?></option>
+      <?php endforeach; ?>
+    </select>
+  </div>
+  <div>
+    <label>Stage</label>
+    <select name="stage" onchange="this.form.submit()">
+      <option value="">All</option>
+      <?php foreach($stageOpts as $s): ?>
+      <option value="<?= e($s) ?>" <?= $fStage===$s?'selected':'' ?>><?= e($s) ?></option>
+      <?php endforeach; ?>
+    </select>
+  </div>
+  <div><button type="submit" class="vq-apply"><i class="fa-solid fa-filter"></i> Filter</button></div>
+  <?php if ($fDept||$fLine||$fBlock||$fStage): ?>
+  <div style="align-self:flex-end">
+    <a href="nc_verify.php" style="font-size:11px;color:var(--muted)">Clear</a>
+  </div>
+  <?php endif; ?>
+</form>
+
+<?php if (empty($ncs)): ?>
+<div class="vq-empty">
+  <i class="fa-solid fa-clipboard-check"></i>
+  <div style="font-size:15px;font-weight:700;margin-bottom:5px">Nothing Awaiting Verification</div>
+  <div style="font-size:12px">
+    <?= ($fDept||$fLine||$fBlock||$fStage)
+        ? 'No matches for the current filters.'
+        : 'All submitted NCs have been processed.' ?>
+  </div>
+  <div style="margin-top:14px">
+    <a href="nc_rca.php" class="btn-primary-q" style="font-size:11px">← Back to Follow-up</a>
+  </div>
+</div>
+
+<?php else: ?>
+
+<!-- BULK BAR -->
+<form method="POST" id="bulkForm">
+  <?= csrf_field() ?>
+  <input type="hidden" name="action" value="bulk_verify">
+  <div class="vq-bulk-bar">
+    <input type="checkbox" class="vq-cb" id="selectAll" onchange="toggleAll(this)">
+    <label for="selectAll" style="margin:0;cursor:pointer;font-weight:600">Select All</label>
+    <span style="color:var(--muted);font-size:10.5px" id="selCount">(0 selected)</span>
+    <button type="submit" class="btn-vq-verify"
+            style="margin-left:auto"
+            onclick="return document.querySelectorAll('.nc-chk:checked').length>0||alert('Select at least one NC')||false">
+      <i class="fa-solid fa-check-circle"></i> Verify Selected
+    </button>
+  </div>
+
+  <!-- GROUPED BY DEPARTMENT -->
+  <?php foreach ($grouped as $dept => $deptNCs): ?>
+  <div>
+    <div class="vq-dept-head" onclick="toggleDept(this)">
+      <i class="fa-solid fa-building" style="color:var(--accent);font-size:12px"></i>
+      <span class="vq-dept-name"><?= e($dept) ?></span>
+      <span class="badge-pill badge-amber" style="font-size:9.5px">
+        <?= count($deptNCs) ?> NC<?= count($deptNCs)!==1?'s':'' ?>
+      </span>
+      <i class="fa-solid fa-chevron-down" style="font-size:10px;color:var(--muted);transition:transform .2s"></i>
+    </div>
+    <div class="vq-dept-body">
+
+    <?php foreach ($deptNCs as $nc):
+      $ncId     = (int)$nc['id'];
+      $hasRCA   = !empty($nc['root_cause']) || !empty($nc['corrective_action']);
+      $sevCls   = match(strtolower($nc['severity']??'medium')){
+                    'critical','high'=>'badge-red','low'=>'badge-green',default=>'badge-amber'};
+      $daysOpen = (int)floor((time()-strtotime($nc['opened_at']))/86400);
+    ?>
+    <div class="vq-card" id="nc-<?= $ncId ?>">
+
+      <!-- Top row -->
+      <div class="vq-card-top">
+        <input type="checkbox" class="vq-cb nc-chk" name="nc_ids[]"
+               value="<?= $ncId ?>" onchange="updateSelCount()">
+        <div class="vq-param"><?= e($nc['defect_type']) ?></div>
+        <?php if (!empty($nc['severity'])): ?>
+        <span class="badge-pill <?= $sevCls ?>" style="font-size:9px"><?= ucfirst($nc['severity']) ?></span>
+        <?php endif; ?>
+        <span class="badge-pill badge-amber" style="font-size:9px">In Review</span>
+      </div>
+
+      <!-- Meta -->
+      <div class="vq-meta">
+        <span><i class="fa-solid fa-hashtag"></i> <?= e($nc['nc_code']) ?></span>
+        <?php if (!empty($nc['audit_code'])): ?>
+        <span><i class="fa-solid fa-file-lines"></i>
+          <a href="report.php?code=<?= urlencode($nc['audit_code']) ?>"
+             style="color:var(--accent);text-decoration:none"><?= e($nc['audit_code']) ?></a>
+        </span>
+        <?php endif; ?>
+        <span><i class="fa-solid fa-industry"></i> <?= e($nc['line']) ?></span>
+        <?php if (!empty($nc['audit_block'])): ?>
+        <span><span class="badge-pill badge-cyan" style="font-size:9px">Block <?= e($nc['audit_block']) ?></span></span>
+        <?php endif; ?>
+        <?php if (!empty($nc['model'])): ?>
+        <span><i class="fa-solid fa-cube"></i> <?= e($nc['model']) ?></span>
+        <?php endif; ?>
+        <?php if (!empty($nc['shift'])): ?>
+        <span><i class="fa-solid fa-clock"></i> <?= e($nc['shift']) ?></span>
+        <?php endif; ?>
+        <span style="color:var(--muted)">
+          <i class="fa-solid fa-calendar"></i>
+          Opened <?= $daysOpen ?>d ago (<?= date('d M Y', strtotime($nc['opened_at'])) ?>)
+        </span>
+        <span><i class="fa-solid fa-layer-group"></i> <?= e($nc['stage']) ?></span>
+      </div>
+
+      <!-- AUDITOR TRACE — who found this NG -->
+      <?php if (!empty($nc['auditor_gen_id']) || !empty($nc['auditor_name'])): ?>
+      <div class="vq-auditor-trace">
+        <i class="fa-solid fa-user-check"></i>
+        <div>
+          NG raised by auditor:
+          <strong><?= e($nc['auditor_name'] ?? '—') ?></strong>
+          <?php if (!empty($nc['auditor_gen_id'])): ?>
+          &nbsp;<span class="badge-pill badge-cyan" style="font-size:9px"><?= e($nc['auditor_gen_id']) ?></span>
+          <?php endif; ?>
+          <?php if (!empty($nc['audit_date'])): ?>
+          &nbsp;on <strong><?= date('d M Y H:i', strtotime($nc['audit_date'])) ?></strong>
+          <?php endif; ?>
+          <span style="margin-left:8px;font-size:9.5px;color:var(--muted)">
+            — This is the person who recorded the NG during the audit
+          </span>
+        </div>
+      </div>
+      <?php endif; ?>
+
+      <!-- FINDING -->
+      <?php if (!empty($nc['ng_value']) || !empty($nc['spec'])): ?>
+      <div class="vq-finding">
+        <i class="fa-solid fa-triangle-exclamation"></i>
+        <?= !empty($nc['ng_value']) ? 'Measured: <strong>'.e($nc['ng_value']).'</strong>' : '' ?>
+        <?= !empty($nc['spec'])     ? ' &nbsp;|&nbsp; Spec: '.e($nc['spec'])  : '' ?>
+        <?= !empty($nc['ng_remark'])? ' &nbsp;|&nbsp; '.e($nc['ng_remark'])  : '' ?>
+      </div>
+      <?php endif; ?>
+
+      <!-- RCA SUBMITTED BY DEPARTMENT -->
+      <?php if ($hasRCA): ?>
+      <div class="vq-rca-box">
+        <div class="vq-rca-head">
+          <i class="fa-solid fa-microscope"></i>
+          RCA Submitted
+          <?php if (!empty($nc['rca_submitted_by'])): ?>
+          <span style="font-weight:400;color:var(--muted)">by <?= e($nc['rca_submitted_by']) ?></span>
+          <?php endif; ?>
+          <?php if (!empty($nc['rca_due'])): ?>
+          <span style="font-weight:400;font-size:9.5px;color:var(--muted);margin-left:auto">
+            Due: <?= date('d M Y', strtotime($nc['rca_due'])) ?>
+          </span>
+          <?php endif; ?>
+        </div>
+        <div class="vq-rca-grid">
+          <div>
+            <div class="vq-rca-lbl">Root Cause</div>
+            <div class="vq-rca-val <?= empty($nc['root_cause'])?'missing':'' ?>">
+              <?= !empty($nc['root_cause']) ? nl2br(e($nc['root_cause'])) : 'Not provided' ?>
+            </div>
+          </div>
+          <div>
+            <div class="vq-rca-lbl">Corrective Action</div>
+            <div class="vq-rca-val <?= empty($nc['corrective_action'])?'missing':'' ?>">
+              <?= !empty($nc['corrective_action']) ? nl2br(e($nc['corrective_action'])) : 'Not provided' ?>
+            </div>
+          </div>
+          <?php if (!empty($nc['defect_desc'])): ?>
+          <div>
+            <div class="vq-rca-lbl">Defect Description</div>
+            <div class="vq-rca-val"><?= nl2br(e($nc['defect_desc'])) ?></div>
+          </div>
+          <?php endif; ?>
+          <?php if (!empty($nc['responsible'])): ?>
+          <div>
+            <div class="vq-rca-lbl">Responsible Person</div>
+            <div class="vq-rca-val"><?= e($nc['responsible']) ?></div>
+          </div>
+          <?php endif; ?>
+        </div>
+      </div>
+
+      <?php else: ?>
+      <div class="vq-no-rca">
+        <i class="fa-solid fa-circle-exclamation"></i>
+        No RCA data submitted. Department marked as in-review without entering root cause.
+        Consider rejecting this NC.
+      </div>
+      <?php endif; ?>
+
+      <!-- ACTION BUTTONS -->
+      <div class="vq-actions">
+        <form method="POST" style="display:inline"
+              onsubmit="return confirm('Verify and close NC #<?= $ncId ?>?')">
+          <?= csrf_field() ?>
+          <input type="hidden" name="action" value="verify">
+          <input type="hidden" name="nc_id"  value="<?= $ncId ?>">
+          <button type="submit" class="btn-vq-verify">
+            <i class="fa-solid fa-check-circle"></i> Verify & Close
+          </button>
+        </form>
+
+        <button type="button" class="btn-vq-reject" onclick="openReject(<?= $ncId ?>)">
+          <i class="fa-solid fa-rotate-left"></i> Reject
+        </button>
+
+        <?php if (!empty($nc['audit_code'])): ?>
+        <a href="report.php?code=<?= urlencode($nc['audit_code']) ?>"
+           class="btn-ghost-q" style="font-size:10.5px;padding:5px 10px">
+          <i class="fa-solid fa-arrow-up-right-from-square"></i> Audit Report
+        </a>
+        <?php endif; ?>
+
+        <!-- Auditor mini-badge in action row -->
+        <?php if (!empty($nc['auditor_gen_id'])): ?>
+        <span style="margin-left:auto;font-size:10px;color:var(--muted)">
+          <i class="fa-solid fa-user-check" style="color:var(--accent)"></i>
+          Auditor: <?= e($nc['auditor_gen_id']) ?>
+        </span>
+        <?php endif; ?>
+      </div>
+
+    </div><!-- /vq-card -->
+    <?php endforeach; ?>
+
+    </div><!-- /dept-body -->
+  </div>
+  <?php endforeach; ?>
+
+</form><!-- /bulkForm -->
+<?php endif; // !empty ncs ?>
+
+    </main>
+  </div>
+</div>
+
+<!-- REJECT MODAL -->
+<div class="vq-backdrop" id="rejectBackdrop" onclick="closeReject()"></div>
+<div class="vq-modal" id="rejectModal">
+  <div style="font-weight:700;font-size:14px;margin-bottom:14px">
+    <i class="fa-solid fa-rotate-left" style="color:var(--amber)"></i>
+    Reject — Return to Department
+  </div>
+  <form method="POST">
+    <?= csrf_field() ?>
+    <input type="hidden" name="action"  value="reject">
+    <input type="hidden" name="nc_id"   id="rejectNcId" value="">
+    <div style="margin-bottom:12px">
+      <label class="field-label">Reason for Rejection *</label>
+      <textarea name="reject_reason" class="form-ctrl" rows="4" required
+                placeholder="Explain what is missing or incorrect in the RCA…"
+                style="width:100%;margin-top:4px;resize:vertical"></textarea>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button type="submit" class="btn-vq-reject" style="flex:1;padding:8px">
+        <i class="fa-solid fa-paper-plane"></i> Reject & Return
+      </button>
+      <button type="button" class="btn-ghost-q" onclick="closeReject()">Cancel</button>
+    </div>
+  </form>
+</div>
+
+<script>
+function toggleDept(h) {
+    var b = h.nextElementSibling;
+    var c = h.querySelector('.fa-chevron-down,.fa-chevron-up');
+    b.style.display = (b.style.display === 'none') ? '' : 'none';
+    if (c) { c.classList.toggle('fa-chevron-down'); c.classList.toggle('fa-chevron-up'); }
+}
+function toggleAll(m) {
+    document.querySelectorAll('.nc-chk').forEach(function(cb){ cb.checked = m.checked; });
+    updateSelCount();
+}
+function updateSelCount() {
+    var n = document.querySelectorAll('.nc-chk:checked').length;
+    document.getElementById('selCount').textContent = '(' + n + ' selected)';
+}
+function openReject(id) {
+    document.getElementById('rejectNcId').value = id;
+    document.getElementById('rejectModal').classList.add('show');
+    document.getElementById('rejectBackdrop').classList.add('show');
+}
+function closeReject() {
+    document.getElementById('rejectModal').classList.remove('show');
+    document.getElementById('rejectBackdrop').classList.remove('show');
+}
+setTimeout(function() {
+    document.querySelectorAll('.alert-success').forEach(function(a) {
+        a.style.transition = 'opacity .5s'; a.style.opacity = '0';
+        setTimeout(function(){ a.remove(); }, 500);
+    });
+}, 4000);
+</script>
+<?php $ASSET = ''; include __DIR__ . '/includes/_foot.php'; ?>
