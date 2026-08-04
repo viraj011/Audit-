@@ -1,0 +1,144 @@
+<?php
+/* ============================================================================
+ *  agent/notifications.php — Department notification inbox from AI agents
+ *  Dept users see their own notifications; PQC/Admin sees all.
+ * ===========================================================================*/
+require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/../includes/components.php';
+requireLogin();
+$db  = db();
+$me  = currentUser();
+
+// Auto-migrate in case agent tables don't exist yet
+require_once __DIR__ . '/agent.php';
+agent_migrate($db);
+
+$userDept = $me['department'] ?? '';
+$isPQC    = !empty($me['can_admin'])
+         || in_array(strtolower($me['role']??''), ['admin','pqc','quality'], true);
+
+// Mark as read
+if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['mark_read'])) {
+    $id=(int)$_POST['mark_read'];
+    $db->prepare("UPDATE agent_notifications SET read_at=NOW() WHERE id=?")->execute([$id]);
+    header('Location: notifications.php'); exit;
+}
+if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['mark_all_read'])) {
+    $q=$isPQC?"UPDATE agent_notifications SET read_at=NOW() WHERE read_at IS NULL":
+              "UPDATE agent_notifications SET read_at=NOW() WHERE read_at IS NULL AND recipient_dept=?";
+    $st=$db->prepare($q); $isPQC?$st->execute():$st->execute([$userDept]);
+    header('Location: notifications.php'); exit;
+}
+
+// Fetch
+if ($isPQC) {
+    $notifs=$db->query("SELECT * FROM agent_notifications ORDER BY created_at DESC LIMIT 100")->fetchAll();
+} else {
+    $st=$db->prepare("SELECT * FROM agent_notifications WHERE recipient_dept=? OR recipient_dept='' ORDER BY created_at DESC LIMIT 50");
+    $st->execute([$userDept]); $notifs=$st->fetchAll();
+}
+$unread=count(array_filter($notifs,fn($n)=>empty($n['read_at'])));
+
+$PAGE_TITLE='Agent Notifications'; $PAGE_HEADING='AI Agent Notifications';
+$PAGE_SUB  ='Alerts, escalations, shift summaries and RCA suggestions from your AI agents';
+$ACTIVE='agent_notif'; $ASSET='../';
+include __DIR__ . '/../includes/_head.php';
+?>
+<style>
+.notif-item{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;gap:14px;align-items:flex-start}
+.notif-item:last-child{border-bottom:none}
+.notif-item.unread{background:rgba(0,212,255,.04);border-left:3px solid var(--accent)}
+.notif-item.read{opacity:.7}
+.notif-icon{width:36px;height:36px;border-radius:9px;display:flex;align-items:center;
+  justify-content:center;font-size:16px;flex-shrink:0}
+.notif-body{flex:1;min-width:0}
+.notif-subject{font-weight:600;font-size:12.5px;margin-bottom:4px}
+.notif-text{font-size:11px;color:var(--muted);white-space:pre-wrap;max-height:100px;overflow:hidden}
+.notif-meta{display:flex;gap:10px;flex-wrap:wrap;font-size:10px;color:var(--muted);margin-top:6px}
+.notif-expand{font-size:10px;color:var(--accent);cursor:pointer;margin-top:4px}
+.badge-unread{background:rgba(0,212,255,.15);color:var(--accent);border:1px solid rgba(0,212,255,.25);
+  border-radius:10px;font-size:9.5px;padding:2px 9px;font-weight:700}
+</style>
+<div class="app">
+<?php include __DIR__ . '/../includes/_sidebar.php'; ?>
+<div class="content">
+<?php include __DIR__ . '/../includes/_topbar.php'; ?>
+<main class="page">
+
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+  <div>
+    <?php if ($unread>0): ?>
+    <span class="badge-unread"><?= $unread ?> unread</span>
+    <?php endif; ?>
+  </div>
+  <?php if ($notifs && $unread>0): ?>
+  <form method="POST" style="display:inline">
+    <button name="mark_all_read" value="1" class="btn-ghost-q" style="font-size:11px">
+      <i class="fa-solid fa-check-double"></i> Mark all read
+    </button>
+  </form>
+  <?php endif; ?>
+</div>
+
+<?php
+$typeIcons=[
+  'line_risk'     => ['🔴','rgba(255,71,87,.12)'],
+  'nonconformity' => ['⚠️','rgba(255,179,64,.1)'],
+  'shift_handover'=> ['📋','rgba(0,212,255,.08)'],
+  'default'       => ['🤖','rgba(139,92,246,.08)'],
+];
+?>
+
+<?php panel_open('Notifications — ' . ($isPQC?'All departments':'Your department'),[]) ?>
+<?php if (empty($notifs)): ?>
+<div style="text-align:center;padding:40px;color:var(--muted)">
+  <i class="fa-solid fa-bell-slash" style="font-size:32px;display:block;margin-bottom:10px;opacity:.3"></i>
+  No notifications yet. Agents will send alerts here when they detect issues.
+</div>
+<?php else: foreach ($notifs as $n):
+  $unread_n = empty($n['read_at']);
+  $etype    = $n['entity_type']??'default';
+  [$ico,$bg]= $typeIcons[$etype] ?? $typeIcons['default'];
+?>
+<div class="notif-item <?= $unread_n?'unread':'read' ?>">
+  <div class="notif-icon" style="background:<?= $bg ?>"><?= $ico ?></div>
+  <div class="notif-body">
+    <div class="notif-subject"><?= htmlspecialchars($n['subject']) ?></div>
+    <div class="notif-text" id="ntxt-<?= $n['id'] ?>"><?= htmlspecialchars(substr($n['body'],0,180)) ?></div>
+    <?php if (strlen($n['body'])>180): ?>
+    <div class="notif-expand" onclick="
+      var el=document.getElementById('ntxt-<?= $n['id'] ?>');
+      var full=<?= json_encode($n['body']) ?>;
+      if(el.dataset.expanded){el.textContent=full.substring(0,180)+'…';delete el.dataset.expanded;this.textContent='Show more'}
+      else{el.textContent=full;el.dataset.expanded=1;this.textContent='Show less'}
+    ">Show more</div>
+    <?php endif; ?>
+    <div class="notif-meta">
+      <?php if (!empty($n['recipient_dept'])): ?>
+      <span><i class="fa-solid fa-building"></i> <?= htmlspecialchars($n['recipient_dept']) ?></span>
+      <?php endif; ?>
+      <?php if (!empty($n['entity_type'])): ?>
+      <span class="badge-pill badge-muted" style="font-size:9px"><?= htmlspecialchars($n['entity_type']) ?></span>
+      <?php endif; ?>
+      <?php if (!empty($n['entity_id'])): ?>
+      <span><?= htmlspecialchars($n['entity_id']) ?></span>
+      <?php endif; ?>
+      <span><i class="fa-regular fa-clock"></i> <?= htmlspecialchars(substr($n['created_at'],0,16)) ?></span>
+      <?php if (!$unread_n): ?>
+      <span style="color:var(--green)"><i class="fa-solid fa-check"></i> Read <?= htmlspecialchars(substr($n['read_at'],0,16)) ?></span>
+      <?php endif; ?>
+    </div>
+  </div>
+  <?php if ($unread_n): ?>
+  <form method="POST" style="flex-shrink:0">
+    <button name="mark_read" value="<?= $n['id'] ?>" class="btn-ghost-q" style="font-size:10px;padding:4px 9px">
+      ✓ Read
+    </button>
+  </form>
+  <?php endif; ?>
+</div>
+<?php endforeach; endif; ?>
+<?php panel_close(); ?>
+
+</main></div></div>
+<?php $ASSET='../'; include __DIR__ . '/../includes/_foot.php'; ?>
