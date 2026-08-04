@@ -1,0 +1,64 @@
+#!/usr/bin/env php
+<?php
+/* ============================================================================
+ *  agent/cron.php — QATS Agent Cron Scheduler
+ *  ---------------------------------------------------------------------------
+ *  Run every 10 minutes via Windows Task Scheduler or Linux cron:
+ *
+ *  Windows Task Scheduler (every 10 min):
+ *    Action: C:\xampp\php\php.exe
+ *    Args:   C:\xampp\htdocs\qats\agent\cron.php
+ *
+ *  Linux cron (every 10 min):
+ *    *\/10 * * * * php /var/www/html/qats/agent/cron.php >> /tmp/qats_agent.log 2>&1
+ *
+ *  Schedule logic:
+ *    Every 10 min : TriageAgent  (catch new NGs fast)
+ *    Every 30 min : AlertAgent   (check ML predictions)
+ *    Every 60 min : EscalationAgent + RCASuggestionAgent
+ *    Shift end    : ShiftHandoverAgent (runs at 06:00, 14:00, 22:00)
+ * ===========================================================================*/
+
+define('AGENT_ROOT', __DIR__);
+define('QATS_ROOT',  dirname(__DIR__));
+require_once QATS_ROOT . '/config/db.php';
+require_once __DIR__ . '/agent.php';
+
+$now   = new DateTime();
+$min   = (int)$now->format('i');
+$hour  = (int)$now->format('H');
+
+$toRun = ['triage'];   // always
+
+// Every 30 min (on :00 and :30)
+if ($min % 30 === 0) $toRun[] = 'alert';
+
+// Every 60 min (on the hour)
+if ($min === 0) {
+    $toRun[] = 'escalation';
+    $toRun[] = 'rca';
+}
+
+// Shift handover: 06:00, 14:00, 22:00
+if (in_array($hour,[6,14,22],true) && $min < 10) {
+    $toRun[] = 'handover';
+}
+
+$toRun = array_unique($toRun);
+$db    = db();
+agent_migrate($db);
+
+echo "[" . $now->format('Y-m-d H:i:s') . "] Running: " . implode(', ', $toRun) . PHP_EOL;
+
+foreach ($toRun as $which) {
+    try {
+        $result = run_agents($which);
+        $actions= $result[$which]['actions'] ?? 0;
+        $skip   = $result[$which]['skipped'] ?? false;
+        echo "  [$which] " . ($skip ? 'skipped' : "$actions action(s)") . PHP_EOL;
+    } catch (Throwable $e) {
+        echo "  [$which] ERROR: " . $e->getMessage() . PHP_EOL;
+    }
+}
+
+echo "[" . date('H:i:s') . "] Done." . PHP_EOL;
