@@ -1,0 +1,180 @@
+# QATS Agentic AI — Setup & Architecture
+
+## What this is
+
+An autonomous AI agent system built on top of your existing QATS.
+Five agents run in the background, each following the **perceive → decide → act** loop.
+Claude (claude-sonnet-4-6) provides natural-language reasoning for each decision.
+All actions are logged to the database for full auditability.
+
+---
+
+## Files
+
+```
+qats/
+└── agent/
+    ├── agent.php          ← Core engine — all 5 agents, Anthropic API calls
+    ├── run.php            ← Browser UI (admin only) to trigger agents manually
+    ├── cron.php           ← CLI script for scheduled automatic execution
+    └── notifications.php  ← Notification inbox for dept users and PQC
+```
+
+---
+
+## Installation
+
+### 1. Copy the agent/ folder
+Copy the entire `agent/` folder into `C:\xampp\htdocs\qats\`
+
+### 2. Set your Anthropic API key
+In Windows, set a system environment variable:
+```
+ANTHROPIC_API_KEY=sk-ant-api03-your-key-here
+```
+Or in XAMPP's PHP environment (php.ini or .htaccess):
+```
+SetEnv ANTHROPIC_API_KEY sk-ant-api03-your-key-here
+```
+**Without the key**, agents run in offline/heuristic mode — they still work but use rule-based fallbacks instead of Claude reasoning.
+
+### 3. Enable cURL in PHP
+In `C:\xampp\php\php.ini`, ensure:
+```
+extension=curl
+```
+is uncommented (no semicolon at the start).
+
+### 4. Database tables (auto-created)
+The first time any agent runs, it auto-creates:
+- `agent_log` — full audit trail of every agent action
+- `agent_notifications` — alerts sent to departments
+- `agent_rca_suggestions` — RCA suggestions from Claude
+
+No manual SQL needed.
+
+---
+
+## Running the agents
+
+### Manual (browser)
+Visit: `http://localhost/qats/agent/run.php`
+Login as Admin. Select an agent and click Run.
+
+### Scheduled (recommended)
+**Windows Task Scheduler:**
+1. Open Task Scheduler → Create Basic Task
+2. Name: "QATS Agent"
+3. Trigger: Daily, repeat every 10 minutes
+4. Action: Start a program
+   - Program: `C:\xampp\php\php.exe`
+   - Arguments: `C:\xampp\htdocs\qats\agent\cron.php`
+5. Run whether user is logged in or not
+
+**Linux cron:**
+```bash
+*/10 * * * * php /var/www/html/qats/agent/cron.php >> /tmp/qats_agent.log 2>&1
+```
+
+---
+
+## The 5 Agents
+
+### 1. TriageAgent (every 10 min)
+**Perceives:** New audit_results rows with result='NG' in the last 10 minutes that have no nonconformity record yet.
+
+**Decides (Claude):** For each NG finding, Claude classifies:
+- Severity: low / medium / high / critical
+- Responsible department: Production / Maintenance / Material / Programming / Quality
+- Due days: how long the department has to respond
+
+**Acts:**
+- Creates a `nonconformities` row with the correct severity
+- Creates a `rca_entries` placeholder with the due date
+- Sends a notification to the responsible department
+
+---
+
+### 2. EscalationAgent (every 60 min)
+**Perceives:** Open NCs where the due date has passed with no root cause submitted.
+
+**Decides (Claude):** Based on how many days overdue, Claude decides:
+- 1-3 days: polite reminder
+- 4-7 days: formal escalation, bump severity
+- 7+ days: critical flag to management
+
+**Acts:**
+- Updates severity in `nonconformities`
+- Sends escalation notification to Quality/management
+
+---
+
+### 3. RCASuggestionAgent (every 60 min)
+**Perceives:** Open NCs with no root cause, created more than 30 minutes ago, with no suggestion already made.
+
+**Decides (Claude):** Reads up to 5 historical RCA entries for the same parameter and stage. Claude synthesises the most likely root cause and corrective action with a confidence score.
+
+**Acts:**
+- Writes suggestion to `agent_rca_suggestions`
+- Dept users see the suggestion pre-filled when they open the RCA form
+
+---
+
+### 4. AlertAgent (every 30 min)
+**Perceives:** `ml/predictions.json` — lines with risk score >= 70 (High class).
+
+**Decides (Claude):** For each high-risk line, Claude writes a specific, actionable alert message referencing the line name, top risk stage, and recommended action.
+
+**Acts:**
+- Sends notification to Quality department
+- Creates a `scheduled_audits` entry for the next day
+
+---
+
+### 5. ShiftHandoverAgent (at 06:00, 14:00, 22:00)
+**Perceives:** All audits from the past 8 hours.
+
+**Decides (Claude):** Generates a structured shift handover summary — overall performance, key NG findings, what the incoming shift needs to watch.
+
+**Acts:**
+- Saves summary to `agent_notifications` for both Quality and Production departments
+- Incoming shift team reads it via the notification inbox
+
+---
+
+## Notification Inbox
+
+Department users see their notifications at:
+`http://localhost/qats/agent/notifications.php`
+
+Add this to the sidebar nav in `includes/_sidebar.php`:
+```php
+['agent_notif', 'AI Notifications', 'fa-bell', $ASSET.'agent/notifications.php'],
+```
+
+---
+
+## Offline mode (no API key)
+
+All agents work without the Anthropic API key using rule-based fallbacks:
+- TriageAgent: uses CTQ flag and stage rules to set severity
+- EscalationAgent: uses days-overdue thresholds
+- RCASuggestionAgent: copies the most recent historical RCA
+- AlertAgent: uses a template message with the line data
+- ShiftHandoverAgent: generates a structured text summary from the DB stats
+
+Set the key when you're ready for full Claude reasoning.
+
+---
+
+## Agent Log
+
+Every action is logged to `agent_log`. You can query it:
+```sql
+SELECT agent_name, action, entity_type, entity_id, result, reasoning, created_at
+FROM agent_log
+ORDER BY created_at DESC
+LIMIT 50;
+```
+
+The Run UI at `agent/run.php` shows the last 40 log entries live.
