@@ -1,0 +1,55 @@
+<?php
+/* ============================================================================
+ *  admin/users.php — create / edit / delete users and assign roles.
+ * ==========================================================================*/
+require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/../includes/admin_layout.php';
+requireAdmin();
+$db = db();
+
+/* role options for the dropdown */
+$roleOpts = [];
+foreach ($db->query("SELECT id, label FROM roles ORDER BY `rank` DESC") as $r) $roleOpts[$r['id']] = $r['label'];
+
+// FIX: there was previously no way for an admin to actually assign a
+// department to a user through this form — nc_rca.php reads
+// users.department and auth.php's post_login_redirect() / requireLogin()
+// route department-only users to nc_rca.php based on it, but the field
+// to SET it didn't exist anywhere in the admin UI. Same canonical list
+// nc_rca.php already uses ($DEPTS), kept in sync manually since it's a
+// short fixed list — if that list changes there, update it here too.
+$deptOpts = ['' => '— None —', 'Production'=>'Production', 'Material'=>'Material',
+             'Maintenance'=>'Maintenance', 'Programming'=>'Programming', 'Quality'=>'Quality'];
+
+$fields = [
+  'name'          => ['type'=>'text','label'=>'Full name','required'=>true],
+  'email'         => ['type'=>'text','label'=>'KnoxId','placeholder'=>'knoxid@samsung.com'],
+  'gen_id'        => ['type'=>'text','label'=>'Gen ID','required'=>true,'help'=>'Unique operator id used on audits'],
+  'password'      => ['type'=>'password','label'=>'Password','required'=>true],
+  'role_id'       => ['type'=>'select','label'=>'Role','options'=>$roleOpts],
+  'department'    => ['type'=>'select','label'=>'Department','options'=>$deptOpts,
+                       'help'=>'Non-admin, non-auditor users with a department land on NC Follow-up only after login'],
+  'status'        => ['type'=>'select','label'=>'Status','options'=>['active'=>'Active','disabled'=>'Disabled']],
+];
+
+crud_dispatch($db, 'users', $fields, 'users.php');
+$editRow = crud_row_for_edit($db, 'users');
+
+$rows = $db->query("
+  SELECT u.id,u.name,u.email,u.gen_id,u.status,u.department,r.label AS role_label
+  FROM users u LEFT JOIN roles r ON r.id=u.role_id ORDER BY u.id
+")->fetchAll();
+
+$listCols = [
+  'name'       => ['label'=>'Name'],
+  'email'      => ['label'=>'Email'],
+  'role_label' => ['label'=>'Role','render'=>fn($r)=>'<span class="badge-pill badge-purple">'.e($r['role_label']??'—').'</span>'],
+  'department' => ['label'=>'Department','render'=>fn($r)=>$r['department']
+                    ? '<span class="badge-pill badge-cyan">'.e($r['department']).'</span>'
+                    : '<span class="text-muted">—</span>'],
+  'status'     => ['label'=>'Status','render'=>fn($r)=>'<span class="badge-pill '.($r['status']==='active'?'badge-green':'badge-muted').'">'.e($r['status']).'</span>'],
+];
+
+admin_page_start('Users', 'Users', 'Add users and assign roles', 'admin_users');
+admin_crud_panel('users', $fields, $listCols, $rows, $editRow, 'users.php', 'user');
+admin_page_end();
