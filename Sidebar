@@ -5,6 +5,23 @@ $ASSET  = $ASSET ?? '';
 $ACTIVE = $ACTIVE ?? 'dashboard';
 $me     = function_exists('currentUser') ? currentUser() : null;
 
+/* FIX: a department user (no admin rights, no auditing role, but has a
+ * department assigned — the same rule post_login_redirect() in auth.php
+ * uses to route them to nc_rca.php on login) previously saw the full
+ * sidebar: Dashboard, Manual/Auto Audit, Audit Records, Follow-up
+ * Audits, Auditor History, Analytics, Prediction Dashboard, and a Quick
+ * Actions panel linking straight into admin-only pages they can't
+ * actually open. They'd land on NC Follow-up after login but every
+ * other link in the sidebar was still sitting right there. Per the
+ * request — "when login is people of different department, it should
+ * open the NC follow up page and should not [show] anything else" —
+ * this now collapses the entire nav to that single page for exactly
+ * that user group. Everyone else (PQC, admin, auditors) is unaffected.
+ * Uses the same is_department_only_user() that requireLogin() enforces
+ * server-side in auth.php, so the sidebar can never show a link that
+ * the page-level gate would then redirect away from anyway. */
+$isDeptOnlyUser = function_exists('is_department_only_user') && is_department_only_user($me);
+
 // [key, label, icon, href]
 $NAV = [
   ['dashboard',   'Dashboard',            'fa-gauge-high',          $ASSET.'dashboard.php'],
@@ -13,7 +30,7 @@ $NAV = [
   ['audits',      'Audit Records',        'fa-table-list',          $ASSET.'audits.php'],
   ['followup',    'Follow-up Audits',     'fa-rotate-right',        $ASSET.'followup.php'],
   ['auditor_history', 'Auditor History',  'fa-user-clock',          $ASSET.'auditor_history.php'],
-  ['nc_rca',      'NC Follow-up & RCA',   'fa-microscope',          $ASSET.'nc_rca.php'],
+  // ['rca',         'RCA Module',           'fa-microscope',          $ASSET.'rca.php'],
   ['analytics',   'Analytics',            'fa-chart-pie',           $ASSET.'analytics.php'],
   ['prediction',  'Prediction Dashboard', 'fa-brain',               $ASSET.'predictivedashboard.php'],
 ];
@@ -35,12 +52,20 @@ $QUICK = [
   ['Add Standard',     'fa-plus',            $ASSET.'admin/parameters.php'],
 ];
 
+/* Department-only users get exactly one nav entry — NC Follow-up — and
+ * no Quick Actions panel, since every quick action links to a page
+ * they don't have access to anyway. */
+if ($isDeptOnlyUser) {
+    $NAV   = [['nc_rca', 'NC Follow-up', 'fa-clipboard-list', $ASSET.'nc_rca.php']];
+    $QUICK = [];
+}
+
 $initials = $me ? strtoupper(substr($me['name'],0,1) . (strpos($me['name'],' ')!==false ? substr($me['name'], strpos($me['name'],' ')+1, 1) : '')) : 'QA';
 ?>
 <aside class="sidebar" id="sidebar">
   <div class="sidebar-brand">
-    <div class="brand-mark"><i class="fa-solid fa-shield-halved"></i></div>
-    <div class="brand-text"><strong>QATS</strong><small>Quality Audit &amp;<br>Tracking System</small></div>
+    <div class="brand-mark"></div>
+    <div class="brand-text"><strong>QATS</strong><small>SIEL Noida &middot; SMD Quality</small></div>
   </div>
 
   <nav class="sidebar-nav">
@@ -51,7 +76,7 @@ $initials = $me ? strtoupper(substr($me['name'],0,1) . (strpos($me['name'],' ')!
       </a>
     <?php endforeach; ?>
 
-    <?php if (!$me || !empty($me['can_admin'])): ?>
+    <?php if (!$isDeptOnlyUser && (!$me || !empty($me['can_admin']))): ?>
       <div class="nav-group-label">Administration</div>
       <?php foreach ($ADMIN_NAV as $n): ?>
         <a class="nav-item <?= $ACTIVE === $n[0] ? 'active' : '' ?>" href="<?= htmlspecialchars($n[3]) ?>">
@@ -61,12 +86,14 @@ $initials = $me ? strtoupper(substr($me['name'],0,1) . (strpos($me['name'],' ')!
     <?php endif; ?>
   </nav>
 
+  <?php if (!empty($QUICK)): ?>
   <div class="quick-actions">
     <div class="quick-head"><span>Quick Actions</span><span class="quick-live"><span class="live-dot"></span>Live</span></div>
     <?php foreach ($QUICK as $q): ?>
       <a class="quick-btn" href="<?= htmlspecialchars($q[2]) ?>"><i class="fa-solid <?= $q[1] ?>"></i> <?= htmlspecialchars($q[0]) ?></a>
     <?php endforeach; ?>
   </div>
+  <?php endif; ?>
 
   <div class="sidebar-user">
     <div class="avatar"><?= htmlspecialchars($initials) ?></div>
