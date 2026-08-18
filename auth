@@ -4,7 +4,7 @@
  *  ---------------------------------------------------------------------------
  *  Standalone replacement for the auth.php referenced by the original
  *  audit.php. Provides: login(), logout(), currentUser(), requireLogin(),
- *  requireAdmin(), can_admin(), can_audit().
+ *  requireAdmin(), can_admin(), can_audit(), post_login_redirect().
  * ==========================================================================*/
 
 require_once __DIR__ . '/../config/db.php';
@@ -13,11 +13,37 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
+/* Auto-migrate: add users.department if it doesn't exist yet.
+ * FIX: nc_rca.php already reads $me['department'] and even carries its
+ * own copy of this same migration, but login() here never SELECTed the
+ * column into the session at all — so department was always empty
+ * regardless of what was actually in the database, and no page could
+ * ever route a department user anywhere differently from anyone else.
+ * Migrating here too (idempotent, same guarded ALTER TABLE pattern used
+ * elsewhere in this project) means auth.php is self-sufficient and this
+ * fix doesn't silently depend on nc_rca.php having been visited first. */
+function auth_migrate_department(): void {
+    try {
+        $chk = db()->query("
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME='department'
+        ");
+        if (!(int)$chk->fetchColumn()) {
+            db()->exec("ALTER TABLE users ADD COLUMN department VARCHAR(80) NULL DEFAULT NULL AFTER status");
+        }
+    } catch (Throwable $e) {}
+}
+
 /* Attempt login with email + password. Returns true on success. */
 function login(string $gen_id, string $password): bool
 {
+    auth_migrate_department();
+
+    // FIX: department was missing from this SELECT entirely, so
+    // $_SESSION['user']['department'] was always null after login no
+    // matter what an admin had set on the account.
     $st = db()->prepare("
-        SELECT u.id, u.gen_id, u.name, u.password_hash, u.status,
+        SELECT u.id, u.gen_id, u.name, u.password_hash, u.status, u.department,
                r.name AS role, r.label AS role_label, r.can_admin, r.can_audit
         FROM users u LEFT JOIN roles r ON r.id = u.role_id
         WHERE u.gen_id = ? LIMIT 1
@@ -35,22 +61,6 @@ function login(string $gen_id, string $password): bool
     return true;
 }
 
-/* Determine redirect target after login based on role/admin flag.
-   PQC / Admin → dashboard.php
-   Department heads without can_admin → nc_rca.php (their NC queue) */
-function post_login_redirect(array $user): string
-{
-    // Roles / dept labels that are PQC / QA (can see dashboard directly)
-    $pqcLabels = ['administrator','quality manager','pqc','quality','admin','auditor'];
-    $roleLabel = strtolower($user['role_label'] ?? '');
-
-    if (!empty($user['can_admin'])) return 'dashboard.php';
-    if (!empty($user['can_audit'])) return 'dashboard.php';
-    // Non-auditor, non-admin dept users go to their NC queue
-    return 'nc_rca.php';
-}
-
-
 function logout(): void
 {
     $_SESSION = [];
@@ -63,12 +73,42 @@ function currentUser(): ?array
     return $_SESSION['user'] ?? null;
 }
 
-/* Redirect to login if not authenticated. */
+/* Redirect to login if not authenticated.
+ * Also enforces the department-only restriction server-side: hiding
+ * links in the sidebar is a UI convenience, not access control — a
+ * department user could otherwise type dashboard.php or audit.php
+ * straight into the address bar and land on a page they were never
+ * meant to reach. This check runs for every page that calls
+ * requireLogin() (which is effectively every page in QATS), so it
+ * can't be bypassed by visiting a page directly, and there's no need
+ * to remember to add this check individually to every top-level file. */
 function requireLogin(): void
 {
     if (!currentUser()) {
         header('Location: ' . base_path() . 'login.php');
         exit;
+    }
+
+    // FIX: auth_migrate_department() previously only ran inside login().
+    // A session created BEFORE this feature was deployed never triggers
+    // that code path again — the person is already logged in, so
+    // login() never re-runs for them. The first time such a session hit
+    // admin/users.php and tried to save a department, it would fail with
+    // "Unknown column 'department'" because the ALTER TABLE had never
+    // executed for that server. Calling the same idempotent migration
+    // here too (it's a single cheap information_schema lookup, and does
+    // nothing at all once the column exists) means the column is
+    // guaranteed present on every request, not just fresh logins.
+    auth_migrate_department();
+
+    if (is_department_only_user()) {
+        // Allow only nc_rca.php (logout.php doesn't call requireLogin
+        // at all, so signing out always works regardless).
+        $script = basename(parse_url($_SERVER['SCRIPT_NAME'] ?? '', PHP_URL_PATH) ?? '');
+        if ($script !== 'nc_rca.php') {
+            header('Location: ' . base_path() . 'nc_rca.php');
+            exit;
+        }
     }
 }
 
@@ -84,6 +124,89 @@ function requireAdmin(): void
 
 function can_admin(): bool { return !empty(currentUser()['can_admin']); }
 function can_audit(): bool { return !empty(currentUser()['can_audit']); }
+
+/* Departments that are treated as PQC/quality-management for routing and
+ * page-level access checks — same list nc_rca.php already uses, kept
+ * here as the single source of truth so both files can't drift apart. */
+function is_pqc_user(?array $u = null): bool
+{
+    $u = $u ?? currentUser();
+    if (!$u) return false;
+    $role = strtolower($u['role'] ?? '');
+    $dept = strtolower($u['department'] ?? '');
+    return !empty($u['can_admin'])
+        || in_array($role, ['admin', 'pqc', 'quality', 'quality manager'], true)
+        || in_array($dept, ['pqc', 'quality', 'qa'], true);
+}
+
+/* Single source of truth for "this user should be confined to
+ * nc_rca.php". Used by both requireLogin() (server-side page gate) and
+ * post_login_redirect() (where to send them right after signing in) —
+ * previously these lived as two separately hand-written boolean
+ * expressions; keeping one function means they can never disagree. */
+function is_department_only_user(?array $u = null): bool
+{
+    $u = $u ?? currentUser();
+    if (!$u) return false;
+    return !is_pqc_user($u)
+        && empty($u['can_audit'])
+        && !empty($u['department']);
+}
+
+/* Decide where a user should land right after login.
+ * FIX: previously login.php sent EVERY user to audit.php unconditionally
+ * — auditors, PQC, admins, and department users (Production, Maintenance,
+ * Material, Programming) all landed on the same audit-entry screen. A
+ * department user has no reason to be on audit.php; their job is closing
+ * out NCs assigned to their department, so they should land on
+ * nc_rca.php and, per the request, see nothing else navigable from
+ * there. PQC/Admin/can_audit users keep the existing audit.php landing
+ * since their job genuinely is running audits.
+ *
+ * "Department user" here means: NOT PQC/Admin, AND has can_audit=0
+ * (their role isn't an auditing role) AND has a department assigned.
+ * A department-tagged user who is ALSO an auditor (can_audit=1) still
+ * goes to audit.php — department is used for NC routing/filtering in
+ * that case, not for restricting where they land.
+ *
+ * FIX: signature changed from post_login_redirect(): string to
+ * post_login_redirect(?array $user = null): string.
+ *
+ * An older version of this file (from before department support was
+ * added) declared this function as post_login_redirect(array $user) —
+ * a REQUIRED parameter — while the version immediately prior to this
+ * fix declared it as post_login_redirect() with NO parameters. Two
+ * different login.php files existed matching each: an older one that
+ * calls post_login_redirect(currentUser()), and a newer one that calls
+ * post_login_redirect() with nothing.
+ *
+ * If a deployed server ends up with the OLD login.php (passes an
+ * argument) paired with the NEWER auth.php (took zero parameters),
+ * PHP throws a fatal ArgumentCountError — "Too few arguments to
+ * function post_login_redirect(), 1 passed ... 0 expected" — despite
+ * the message saying "too few", because PHP counts a zero-parameter
+ * function as expecting exactly zero, and one was supplied. Note the
+ * reverse pairing (new login.php calling with no args, old auth.php
+ * requiring one) is a DIFFERENT and equally fatal error — "too few
+ * arguments... 0 passed... exactly 1 expected" — PHP does not allow
+ * omitting a required parameter either. Neither direction degrades
+ * gracefully; both are fatal.
+ *
+ * Making the parameter OPTIONAL (?array $user = null) makes this
+ * function callable both as post_login_redirect() and as
+ * post_login_redirect($someUserArray) — whichever calling convention
+ * a given login.php on disk happens to use, this function now accepts
+ * it, permanently closing off this whole class of version-mismatch
+ * error regardless of which login.php ends up paired with this file. */
+function post_login_redirect(?array $user = null): string
+{
+    $u = $user ?? currentUser();
+    if (!$u) return base_path() . 'login.php';
+
+    return is_department_only_user($u)
+        ? base_path() . 'nc_rca.php'
+        : base_path() . 'audit.php';
+}
 
 /* Resolve the app root URL prefix so links work from / and /admin alike. */
 function base_path(): string
