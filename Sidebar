@@ -5,22 +5,19 @@ $ASSET  = $ASSET ?? '';
 $ACTIVE = $ACTIVE ?? 'dashboard';
 $me     = function_exists('currentUser') ? currentUser() : null;
 
-/* FIX: a department user (no admin rights, no auditing role, but has a
- * department assigned — the same rule post_login_redirect() in auth.php
- * uses to route them to nc_rca.php on login) previously saw the full
- * sidebar: Dashboard, Manual/Auto Audit, Audit Records, Follow-up
- * Audits, Auditor History, Analytics, Prediction Dashboard, and a Quick
- * Actions panel linking straight into admin-only pages they can't
- * actually open. They'd land on NC Follow-up after login but every
- * other link in the sidebar was still sitting right there. Per the
- * request — "when login is people of different department, it should
- * open the NC follow up page and should not [show] anything else" —
- * this now collapses the entire nav to that single page for exactly
- * that user group. Everyone else (PQC, admin, auditors) is unaffected.
- * Uses the same is_department_only_user() that requireLogin() enforces
- * server-side in auth.php, so the sidebar can never show a link that
- * the page-level gate would then redirect away from anyway. */
-$isDeptOnlyUser = function_exists('is_department_only_user') && is_department_only_user($me);
+/* FIX: this used to check a single is_department_only_user() boolean,
+ * which had a real bug — it exempted any department user whose ROLE
+ * happened to have can_audit=1 set (a common, normal setup, since
+ * can_audit is usually just "may use audit.php" on a role rather than
+ * "is specifically a dedicated auditor"). A Maintenance/Production
+ * account built on such a role saw the FULL sidebar exactly like an
+ * unrestricted user. auth.php now resolves one of three tiers via
+ * user_access_tier() — 'pqc', 'auditor', or 'department' — and that is
+ * the single source of truth this file reads from, matching exactly
+ * what requireLogin() enforces server-side. A link is only ever shown
+ * here if the tier's page-level gate would actually let the click
+ * through — never a dead-end link that immediately redirects away. */
+$tier = function_exists('user_access_tier') ? user_access_tier($me) : 'pqc';
 
 // [key, label, icon, href]
 $NAV = [
@@ -52,13 +49,29 @@ $QUICK = [
   ['Add Standard',     'fa-plus',            $ASSET.'admin/parameters.php'],
 ];
 
-/* Department-only users get exactly one nav entry — NC Follow-up — and
- * no Quick Actions panel, since every quick action links to a page
- * they don't have access to anyway. */
-if ($isDeptOnlyUser) {
+if ($tier === 'department') {
+    // Tier 3: exactly one link, matching requireLogin()'s allowlist of
+    // exactly one page for this tier. No Quick Actions — every quick
+    // action links to a page this tier can't reach.
     $NAV   = [['nc_rca', 'NC Follow-up', 'fa-clipboard-list', $ASSET.'nc_rca.php']];
     $QUICK = [];
+} elseif ($tier === 'auditor') {
+    // Tier 2: audit entry, audit records, edit/delete, follow-up,
+    // auditor history, analytics, and dashboard — matching
+    // AUDITOR_ALLOWED_PAGES in auth.php exactly. Prediction Dashboard
+    // is intentionally dropped: it isn't on that allowlist, so leaving
+    // it visible here would show a link that immediately redirects
+    // away the moment it's clicked. Auto Audit shares audit.php's
+    // script name (only the query string differs) so it stays.
+    $NAV = array_values(array_filter($NAV, fn($n) => $n[0] !== 'prediction'));
+    // Auditors don't get the Admin section or admin-linked Quick
+    // Actions regardless of what can_admin says on their role — tier
+    // is now the deciding signal for nav visibility, not the raw flag.
+    $QUICK = array_values(array_filter($QUICK, fn($q) =>
+        !str_contains($q[2], 'admin/')
+    ));
 }
+// tier === 'pqc' → full $NAV, full $QUICK, Admin section shown below.
 
 $initials = $me ? strtoupper(substr($me['name'],0,1) . (strpos($me['name'],' ')!==false ? substr($me['name'], strpos($me['name'],' ')+1, 1) : '')) : 'QA';
 ?>
@@ -76,7 +89,7 @@ $initials = $me ? strtoupper(substr($me['name'],0,1) . (strpos($me['name'],' ')!
       </a>
     <?php endforeach; ?>
 
-    <?php if (!$isDeptOnlyUser && (!$me || !empty($me['can_admin']))): ?>
+    <?php if ($tier === 'pqc' && (!$me || !empty($me['can_admin']))): ?>
       <div class="nav-group-label">Administration</div>
       <?php foreach ($ADMIN_NAV as $n): ?>
         <a class="nav-item <?= $ACTIVE === $n[0] ? 'active' : '' ?>" href="<?= htmlspecialchars($n[3]) ?>">
