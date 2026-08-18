@@ -73,15 +73,91 @@ function currentUser(): ?array
     return $_SESSION['user'] ?? null;
 }
 
+/* Departments that are treated as PQC/quality-management for routing and
+ * page-level access checks — same list nc_rca.php already uses, kept
+ * here as the single source of truth so both files can't drift apart. */
+function is_pqc_user(?array $u = null): bool
+{
+    $u = $u ?? currentUser();
+    if (!$u) return false;
+    $role = strtolower($u['role'] ?? '');
+    $dept = strtolower($u['department'] ?? '');
+    return !empty($u['can_admin'])
+        || in_array($role, ['admin', 'pqc', 'quality', 'quality manager'], true)
+        || in_array($dept, ['pqc', 'quality', 'qa'], true);
+}
+
+/* FIX — this replaces the old binary is_department_only_user() rule,
+ * which was the actual cause of "logging in as a department user still
+ * opens the dashboard." That rule read:
+ *
+ *     return !is_pqc_user($u) && empty($u['can_audit']) && !empty($u['department']);
+ *
+ * The moment a department user's ROLE also has can_audit=1 set — which
+ * is a completely normal, common setup, since can_audit is usually the
+ * generic "may use audit.php" flag on a role rather than a marker for
+ * "is specifically a dedicated auditor" — that condition is false, and
+ * the whole redirect/lockdown was skipped entirely. A Maintenance or
+ * Production account with can_audit=1 on its role sailed straight past
+ * every check and landed on the dashboard exactly like an admin would.
+ *
+ * There are three genuinely distinct access tiers here, not two:
+ *
+ *   1. PQC / Admin / Quality Manager  → everything (unrestricted)
+ *   2. Auditor                        → audit.php, audits.php,
+ *                                        followup.php, audit_edit.php,
+ *                                        analytics*.php, dashboard.php,
+ *                                        auditor_history.php — and
+ *                                        NOTHING else
+ *   3. Department user (Production,
+ *      Material, Maintenance,
+ *      Programming, or any other
+ *      non-PQC department)            → nc_rca.php ONLY, no exceptions
+ *
+ * A department being set on the account is now the decisive signal for
+ * tier 3, full stop — it no longer matters what can_audit says. Only
+ * PQC/Admin escape tier 3. A plain "Auditor" role with NO department
+ * set falls into tier 2. This single function is the shared source of
+ * truth for both requireLogin()'s page gate and post_login_redirect()'s
+ * landing page, exactly like is_department_only_user() was before, so
+ * they can never disagree with each other. */
+function user_access_tier(?array $u = null): string
+{
+    $u = $u ?? currentUser();
+    if (!$u) return 'guest';
+
+    if (is_pqc_user($u)) return 'pqc';
+
+    // A department is set (and it isn't a PQC-equivalent department,
+    // already ruled out above) → always tier 3, regardless of can_audit.
+    if (!empty($u['department'])) return 'department';
+
+    return 'auditor';
+}
+
+/* Page allowlist for the 'auditor' tier — every other page falls
+ * through to requireLogin()'s default redirect (dashboard.php) for
+ * this tier. Filenames only, matched against basename(SCRIPT_NAME), so
+ * this works the same whether the request came from the site root or
+ * from a subfolder. Keep this list in sync with _sidebar.php's nav for
+ * this tier — the sidebar should never link to a page this array
+ * doesn't also permit, or the link would be visible but redirect away
+ * the moment it's clicked. */
+const AUDITOR_ALLOWED_PAGES = [
+    'audit.php', 'audits.php', 'audit_edit.php', 'followup.php',
+    'auditor_history.php',
+    'analytics.php', 'analytics1.php', 'analytics2.php',
+    'dashboard.php',
+];
+
 /* Redirect to login if not authenticated.
- * Also enforces the department-only restriction server-side: hiding
- * links in the sidebar is a UI convenience, not access control — a
- * department user could otherwise type dashboard.php or audit.php
- * straight into the address bar and land on a page they were never
- * meant to reach. This check runs for every page that calls
- * requireLogin() (which is effectively every page in QATS), so it
- * can't be bypassed by visiting a page directly, and there's no need
- * to remember to add this check individually to every top-level file. */
+ * Also enforces both restricted tiers server-side: hiding links in the
+ * sidebar is a UI convenience, not access control — a restricted user
+ * could otherwise type any page name straight into the address bar and
+ * land on something they were never meant to reach. This check runs on
+ * every page that calls requireLogin() (effectively every page in
+ * QATS), so it can't be bypassed by visiting a page directly, and there
+ * is no per-page checklist to remember to update. */
 function requireLogin(): void
 {
     if (!currentUser()) {
@@ -101,18 +177,33 @@ function requireLogin(): void
     // guaranteed present on every request, not just fresh logins.
     auth_migrate_department();
 
-    if (is_department_only_user()) {
-        // Allow only nc_rca.php (logout.php doesn't call requireLogin
-        // at all, so signing out always works regardless).
-        $script = basename(parse_url($_SERVER['SCRIPT_NAME'] ?? '', PHP_URL_PATH) ?? '');
+    $tier   = user_access_tier();
+    $script = basename(parse_url($_SERVER['SCRIPT_NAME'] ?? '', PHP_URL_PATH) ?? '');
+
+    if ($tier === 'department') {
+        // Tier 3: NC Follow-up only, no exceptions. (logout.php doesn't
+        // call requireLogin() at all, so signing out always works.)
         if ($script !== 'nc_rca.php') {
             header('Location: ' . base_path() . 'nc_rca.php');
             exit;
         }
+    } elseif ($tier === 'auditor') {
+        // Tier 2: the fixed allowlist above. Anything not on it sends
+        // the auditor back to dashboard.php, which IS on the allowlist,
+        // so this can't loop.
+        if (!in_array($script, AUDITOR_ALLOWED_PAGES, true)) {
+            header('Location: ' . base_path() . 'dashboard.php');
+            exit;
+        }
     }
+    // tier === 'pqc' → unrestricted, no check needed.
 }
 
-/* Redirect to dashboard if the user has no admin rights. */
+/* Redirect to dashboard if the user has no admin rights.
+ * Unchanged in behaviour from before — can_admin is still the specific
+ * "true administrator" flag and is independent of the tier system above
+ * (a PQC-tier Quality Manager without can_admin set still can't reach
+ * admin-only pages, exactly as before). */
 function requireAdmin(): void
 {
     requireLogin();
@@ -125,85 +216,37 @@ function requireAdmin(): void
 function can_admin(): bool { return !empty(currentUser()['can_admin']); }
 function can_audit(): bool { return !empty(currentUser()['can_audit']); }
 
-/* Departments that are treated as PQC/quality-management for routing and
- * page-level access checks — same list nc_rca.php already uses, kept
- * here as the single source of truth so both files can't drift apart. */
-function is_pqc_user(?array $u = null): bool
-{
-    $u = $u ?? currentUser();
-    if (!$u) return false;
-    $role = strtolower($u['role'] ?? '');
-    $dept = strtolower($u['department'] ?? '');
-    return !empty($u['can_admin'])
-        || in_array($role, ['admin', 'pqc', 'quality', 'quality manager'], true)
-        || in_array($dept, ['pqc', 'quality', 'qa'], true);
-}
-
-/* Single source of truth for "this user should be confined to
- * nc_rca.php". Used by both requireLogin() (server-side page gate) and
- * post_login_redirect() (where to send them right after signing in) —
- * previously these lived as two separately hand-written boolean
- * expressions; keeping one function means they can never disagree. */
-function is_department_only_user(?array $u = null): bool
-{
-    $u = $u ?? currentUser();
-    if (!$u) return false;
-    return !is_pqc_user($u)
-        && empty($u['can_audit'])
-        && !empty($u['department']);
-}
-
 /* Decide where a user should land right after login.
  * FIX: previously login.php sent EVERY user to audit.php unconditionally
  * — auditors, PQC, admins, and department users (Production, Maintenance,
- * Material, Programming) all landed on the same audit-entry screen. A
- * department user has no reason to be on audit.php; their job is closing
- * out NCs assigned to their department, so they should land on
- * nc_rca.php and, per the request, see nothing else navigable from
- * there. PQC/Admin/can_audit users keep the existing audit.php landing
- * since their job genuinely is running audits.
+ * Material, Programming) all landed on the same audit-entry screen.
  *
- * "Department user" here means: NOT PQC/Admin, AND has can_audit=0
- * (their role isn't an auditing role) AND has a department assigned.
- * A department-tagged user who is ALSO an auditor (can_audit=1) still
- * goes to audit.php — department is used for NC routing/filtering in
- * that case, not for restricting where they land.
+ * FIX (second pass): the original department-only fix used a rule that
+ * exempted anyone whose ROLE had can_audit=1, even if they were a
+ * department user. Since can_audit is normally just the generic "may
+ * use audit.php" flag on a role rather than a marker for "is
+ * specifically a dedicated auditor," any department account built on a
+ * role with can_audit=1 slipped straight through and landed on
+ * audit.php/dashboard.php exactly like an unrestricted user — this was
+ * the actual cause of "logging in as a department user still opens the
+ * dashboard." Now uses user_access_tier() (see above), where having a
+ * department set is decisive for tier 3 regardless of can_audit — only
+ * PQC/Admin escape it.
  *
- * FIX: signature changed from post_login_redirect(): string to
- * post_login_redirect(?array $user = null): string.
- *
- * An older version of this file (from before department support was
- * added) declared this function as post_login_redirect(array $user) —
- * a REQUIRED parameter — while the version immediately prior to this
- * fix declared it as post_login_redirect() with NO parameters. Two
- * different login.php files existed matching each: an older one that
- * calls post_login_redirect(currentUser()), and a newer one that calls
- * post_login_redirect() with nothing.
- *
- * If a deployed server ends up with the OLD login.php (passes an
- * argument) paired with the NEWER auth.php (took zero parameters),
- * PHP throws a fatal ArgumentCountError — "Too few arguments to
- * function post_login_redirect(), 1 passed ... 0 expected" — despite
- * the message saying "too few", because PHP counts a zero-parameter
- * function as expecting exactly zero, and one was supplied. Note the
- * reverse pairing (new login.php calling with no args, old auth.php
- * requiring one) is a DIFFERENT and equally fatal error — "too few
- * arguments... 0 passed... exactly 1 expected" — PHP does not allow
- * omitting a required parameter either. Neither direction degrades
- * gracefully; both are fatal.
- *
- * Making the parameter OPTIONAL (?array $user = null) makes this
- * function callable both as post_login_redirect() and as
- * post_login_redirect($someUserArray) — whichever calling convention
- * a given login.php on disk happens to use, this function now accepts
- * it, permanently closing off this whole class of version-mismatch
- * error regardless of which login.php ends up paired with this file. */
+ * Uses the exact same tiering requireLogin() enforces server-side, so
+ * the landing page and the page-level gate can never disagree:
+ *   pqc        → audit.php   (their normal working page; every page is
+ *                              reachable from there via the full nav)
+ *   auditor    → audit.php   (on their allowlist; dashboard.php is too,
+ *                              but audit.php is the actual day-to-day
+ *                              workspace)
+ *   department → nc_rca.php  (the only page they can reach at all) */
 function post_login_redirect(?array $user = null): string
 {
     $u = $user ?? currentUser();
     if (!$u) return base_path() . 'login.php';
 
-    return is_department_only_user($u)
+    return user_access_tier($u) === 'department'
         ? base_path() . 'nc_rca.php'
         : base_path() . 'audit.php';
 }
