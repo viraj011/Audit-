@@ -1,0 +1,39 @@
+<?php
+/* ============================================================================
+ *  includes/_topbar.php — sticky header showing page title/sub and user menu.
+ *  ---------------------------------------------------------------------------
+ *  Missing from the delivered project files, same as helpers.php/_foot.php/
+ *  components.php found in earlier fixes. Referenced via
+ *  include __DIR__.'/includes/_topbar.php' on every content page
+ *  (audits.php, dashboard.php, nc_rca.php, etc., right after opening
+ *  <div class="content">). A missing include() (as opposed to
+ *  require_once()) is only a WARNING, not fatal — so pages using it
+ *  don't crash, but render with a broken/absent header bar and a
+ *  visible PHP warning if display_errors is on, or silently missing
+ *  markup if it's off.
+ * ==========================================================================*/
+$me = function_exists('currentUser') ? currentUser() : null;
+$initials = $me ? strtoupper(substr($me['name'],0,1) . (strpos($me['name'],' ')!==false ? substr($me['name'], strpos($me['name'],' ')+1, 1) : '')) : 'QA';
+?>
+<header class="topbar">
+  <button class="icon-btn sidebar-toggle" data-sidebar-toggle aria-label="Menu">
+    <i class="fa-solid fa-bars"></i>
+  </button>
+  <div class="topbar-title">
+    <h1><?= htmlspecialchars($PAGE_HEADING ?? $PAGE_TITLE ?? 'QATS') ?></h1>
+    <?php if (!empty($PAGE_SUB)): ?><p><?= htmlspecialchars($PAGE_SUB) ?></p><?php endif; ?>
+  </div>
+  <div class="topbar-tools">
+    <button class="icon-btn" data-theme-toggle aria-label="Toggle theme">
+      <i class="fa-solid fa-moon theme-icon-dark"></i>
+      <i class="fa-solid fa-sun theme-icon-light"></i>
+    </button>
+    <div class="topbar-user">
+      <div class="avatar"><?= htmlspecialchars($initials) ?></div>
+      <div class="d-none d-md-block">
+        <strong><?= htmlspecialchars($me['name'] ?? 'Guest') ?></strong>
+        <small><?= htmlspecialchars($me['role_label'] ?? '') ?></small>
+      </div>
+    </div>
+  </div>
+</header>
