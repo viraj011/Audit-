@@ -1,0 +1,657 @@
+<?php
+/* ============================================================================
+ *  audits.php — browse, filter, chart, and export audit records
+ *  ---------------------------------------------------------------------------
+ *  FIX: this file called e() throughout (used to escape every field in
+ *  the row table — audit code, operator, line, model, etc.) but never
+ *  required includes/helpers.php, which is where e() is defined. That
+ *  produced a fatal "Call to undefined function e()" the instant the
+ *  page tried to render the first data row. Reproduced directly against
+ *  a real PHP server: with display_errors off (the normal production
+ *  setting), that fatal error produces a silently truncated page —
+ *  everything up to the point of failure renders (header, filters, KPI
+ *  strip), then output just stops, with no visible error and an empty
+ *  table body. From the browser this looks exactly like "no audits are
+ *  showing" or "the list looks wrong" — the page never gets far enough
+ *  to actually render any rows at all, correctly sorted or not.
+ * ==========================================================================*/
+require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/helpers.php';
+require_once __DIR__ . '/includes/components.php';
+requireLogin();
+$db = db();
+
+/* ---- Filter inputs ------------------------------------------------------- */
+$fSearch  = trim($_GET['search']    ?? '');
+$fAuditor = trim($_GET['auditor']   ?? '');
+$fLine    = trim($_GET['line']      ?? '');
+$fModel   = trim($_GET['model']     ?? '');
+$fShift   = trim($_GET['shift']     ?? '');
+$fType    = trim($_GET['type']      ?? '');
+$fResult  = trim($_GET['result']    ?? '');
+$fFrom    = trim($_GET['date_from'] ?? '');
+$fTo      = trim($_GET['date_to']   ?? '');
+
+/* ---- Dropdown sources ---------------------------------------------------- */
+$optAuditors = $db->query("SELECT DISTINCT operator FROM audits WHERE operator<>'' ORDER BY operator")->fetchAll(PDO::FETCH_COLUMN) ?: [];
+$optLines    = $db->query("SELECT DISTINCT line    FROM audits WHERE line<>'' ORDER BY line")->fetchAll(PDO::FETCH_COLUMN) ?: [];
+$optModels   = $db->query("SELECT DISTINCT model   FROM audits WHERE model IS NOT NULL AND model<>'' ORDER BY model")->fetchAll(PDO::FETCH_COLUMN) ?: [];
+$optShifts   = $db->query("SELECT DISTINCT shift   FROM audits WHERE shift<>'' ORDER BY shift")->fetchAll(PDO::FETCH_COLUMN) ?: [];
+$optTypes    = $db->query("SELECT DISTINCT audit_type FROM audits WHERE audit_type<>'' ORDER BY audit_type")->fetchAll(PDO::FETCH_COLUMN) ?: [];
+
+/* ---- Build WHERE --------------------------------------------------------- */
+$where = ' WHERE 1=1 '; $p = [];
+if ($fAuditor !== '') { $where .= ' AND operator = ?';   $p[] = $fAuditor; }
+if ($fLine    !== '') { $where .= ' AND line = ?';       $p[] = $fLine; }
+if ($fModel   !== '') { $where .= ' AND model = ?';      $p[] = $fModel; }
+if ($fShift   !== '') { $where .= ' AND shift = ?';      $p[] = $fShift; }
+if ($fType    !== '') { $where .= ' AND audit_type = ?'; $p[] = $fType; }
+if ($fResult === 'pass') { $where .= ' AND ng_count = 0'; }
+if ($fResult === 'fail') { $where .= ' AND ng_count > 0'; }
+if ($fFrom !== '') { $where .= ' AND DATE(created_at) >= ?'; $p[] = $fFrom; }
+if ($fTo   !== '') { $where .= ' AND DATE(created_at) <= ?'; $p[] = $fTo; }
+if ($fSearch !== '') {
+    $like = '%' . $fSearch . '%';
+    $where .= ' AND (audit_code LIKE ? OR operator LIKE ? OR line LIKE ? OR model LIKE ?)';
+    $p[] = $like; $p[] = $like; $p[] = $like; $p[] = $like;
+}
+
+$hasFilter = ($fSearch||$fAuditor||$fLine||$fModel||$fShift||$fType||$fResult||$fFrom||$fTo);
+
+/* ---- CSV export (before any HTML) --------------------------------------- */
+if (isset($_GET['export']) && $_GET['export'] === 'csv') {
+    $expSt = $db->prepare("SELECT audit_code, audit_type, line, model, shift, operator, ng_count, total_checks, pass_rate, created_at FROM audits $where ORDER BY created_at DESC LIMIT 5000");
+    $expSt->execute($p);
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="qats_audits_'.date('Ymd_His').'.csv"');
+    $out = fopen('php://output','w');
+    fputcsv($out, ['Audit ID','Type','Line','Model','Shift','Operator','NG Count','Total Checks','Pass Rate %','Date']);
+    while ($r = $expSt->fetch()) {
+        fputcsv($out, [$r['audit_code'],$r['audit_type'],$r['line'],$r['model']??'',$r['shift'],$r['operator'],(int)$r['ng_count'],(int)$r['total_checks'],$r['pass_rate'],date('Y-m-d H:i',strtotime($r['created_at']))]);
+    }
+    fclose($out); exit;
+}
+
+/* ---- Records (filtered) ------------------------------------------------- */
+$rowsSt = $db->prepare("SELECT audit_code, audit_type, line, model, shift, operator, ng_count, pass_rate, created_at FROM audits $where ORDER BY created_at DESC LIMIT 300");
+$rowsSt->execute($p); $rows = $rowsSt->fetchAll();
+
+/* ---- Summary KPIs ------------------------------------------------------- */
+$sumSt = $db->prepare("SELECT COUNT(*) total, COALESCE(ROUND(AVG(pass_rate),1),0) avg_pass,
+                       COALESCE(SUM(ng_count),0) total_ng, COUNT(CASE WHEN ng_count=0 THEN 1 END) clean
+                       FROM audits $where");
+$sumSt->execute($p); $sum = $sumSt->fetch() ?: ['total'=>0,'avg_pass'=>0,'total_ng'=>0,'clean'=>0];
+$cleanRate = $sum['total'] > 0 ? round($sum['clean'] / $sum['total'] * 100, 1) : 0;
+
+/* ---- Chart data ---------------------------------------------------------- */
+// Chart 1: audits + avg pass rate over time
+$tSt = $db->prepare("SELECT DATE(created_at) d, COUNT(*) cnt, ROUND(AVG(pass_rate),1) pr FROM audits $where GROUP BY d ORDER BY d ASC LIMIT 60");
+$tSt->execute($p); $T = $tSt->fetchAll();
+
+// Chart 2: top lines by NG
+$lSt = $db->prepare("SELECT line, SUM(ng_count) ng, COUNT(*) cnt FROM audits $where GROUP BY line HAVING ng > 0 ORDER BY ng DESC LIMIT 10");
+$lSt->execute($p); $L = $lSt->fetchAll();
+
+// Stage-NG breakdown per line (for the drilldown tooltip)
+// $where starts with "WHERE 1=1 AND ..." — strip the WHERE keyword for sub-joining
+$whereAnd = preg_replace('/^\s*WHERE\s*/i', '', $where); // becomes "1=1 AND ..."
+$stageSt = $db->prepare("SELECT a.line, ar.stage,
+    COUNT(*) AS ng_count
+    FROM audit_results ar
+    JOIN audits a ON a.id = ar.audit_id
+    WHERE ar.result='NG' AND $whereAnd
+    GROUP BY a.line, ar.stage
+    ORDER BY a.line, ng_count DESC");
+$stageSt->execute($p); $stageRows = $stageSt->fetchAll();
+// pivot: line -> [{stage, count}]
+$stageByLine = [];
+foreach ($stageRows as $sr) {
+    $stageByLine[$sr['line']][] = ['stage'=>$sr['stage'],'count'=>(int)$sr['ng_count']];
+}
+
+// Overall stage breakdown (all lines)
+$topStageSt = $db->prepare("SELECT ar.stage, COUNT(*) ng_count
+    FROM audit_results ar JOIN audits a ON a.id=ar.audit_id
+    WHERE ar.result='NG' AND $whereAnd GROUP BY ar.stage ORDER BY ng_count DESC LIMIT 12");
+$topStageSt->execute($p); $stageAll = $topStageSt->fetchAll();
+
+// Top operators by NG count (server-side, full dataset, respects filters)
+$opSt = $db->prepare("SELECT operator, SUM(ng_count) AS ng, COUNT(*) AS audits,
+    ROUND(AVG(pass_rate),1) AS avg_pass
+    FROM audits $where GROUP BY operator HAVING ng > 0 ORDER BY ng DESC LIMIT 12");
+$opSt->execute($p); $opRows = $opSt->fetchAll();
+
+// Stage breakdown per operator (for click drilldown)
+$opStageSt = $db->prepare("SELECT a.operator, ar.stage, COUNT(*) AS ng_count
+    FROM audit_results ar
+    JOIN audits a ON a.id = ar.audit_id
+    WHERE ar.result='NG' AND $whereAnd
+    GROUP BY a.operator, ar.stage
+    ORDER BY a.operator, ng_count DESC");
+$opStageSt->execute($p); $opStageRows = $opStageSt->fetchAll();
+$stageByOp = [];
+foreach ($opStageRows as $osr) {
+    $stageByOp[$osr['operator']][] = ['stage'=>$osr['stage'],'count'=>(int)$osr['ng_count']];
+}
+
+// Chart 3: audit type distribution
+$tySt = $db->prepare("SELECT audit_type, COUNT(*) cnt FROM audits $where GROUP BY audit_type ORDER BY cnt DESC");
+$tySt->execute($p); $TY = $tySt->fetchAll();
+
+// Chart 4: pass-rate band distribution (≥95 / 90-95 / 75-90 / <75)
+$bSt = $db->prepare("SELECT
+    SUM(CASE WHEN pass_rate>=95 THEN 1 ELSE 0 END) b4,
+    SUM(CASE WHEN pass_rate>=90 AND pass_rate<95 THEN 1 ELSE 0 END) b3,
+    SUM(CASE WHEN pass_rate>=75 AND pass_rate<90 THEN 1 ELSE 0 END) b2,
+    SUM(CASE WHEN pass_rate<75 THEN 1 ELSE 0 END) b1
+    FROM audits $where");
+$bSt->execute($p); $B = $bSt->fetch() ?: ['b4'=>0,'b3'=>0,'b2'=>0,'b1'=>0];
+
+$CHART = [
+  'time_labels' => array_column($T,'d'),
+  'time_cnt'    => array_map('intval',   array_column($T,'cnt')),
+  'time_pr'     => array_map('floatval', array_column($T,'pr')),
+  'line_labels'    => array_column($L,'line'),
+  'line_ng'        => array_map('intval', array_column($L,'ng')),
+  'stage_by_line'  => $stageByLine,
+  'stage_labels'   => array_column($stageAll,'stage'),
+  'stage_ng_all'   => array_map('intval', array_column($stageAll,'ng_count')),
+  'op_labels'      => array_column($opRows,'operator'),
+  'op_ng'          => array_map('intval',   array_column($opRows,'ng')),
+  'op_audits'      => array_map('intval',   array_column($opRows,'audits')),
+  'op_pass'        => array_map('floatval', array_column($opRows,'avg_pass')),
+  'stage_by_op'    => $stageByOp,
+  'type_labels' => array_column($TY,'audit_type'),
+  'type_cnt'    => array_map('intval',   array_column($TY,'cnt')),
+  'band'        => [(int)$B['b4'],(int)$B['b3'],(int)$B['b2'],(int)$B['b1']],
+];
+
+/* ---- Build export query string (preserve filters) ----------------------- */
+$exportParams = array_filter(['auditor'=>$fAuditor,'line'=>$fLine,'model'=>$fModel,'shift'=>$fShift,
+    'type'=>$fType,'result'=>$fResult,'date_from'=>$fFrom,'date_to'=>$fTo,'search'=>$fSearch]);
+$csvUrl = 'audits.php?export=csv&' . http_build_query($exportParams);
+$pdfUrl = 'audits.php?export=pdf&' . http_build_query($exportParams);
+
+$PAGE_TITLE='Audit Records'; $PAGE_HEADING='Audit Records';
+$PAGE_SUB='Filter, analyse, and export quality audit data';
+$ACTIVE='audits'; $ASSET='';
+include __DIR__ . '/includes/_head.php';
+?>
+<style>
+/* ── Filter bar ─────────────────────────────────────────────── */
+.flt{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;margin-bottom:14px}
+.flt-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr 1fr;gap:10px}
+.flt-row2{display:grid;grid-template-columns:1fr 1fr 1fr 1fr auto auto;gap:10px;margin-top:10px;align-items:flex-end}
+.flt .fg{display:flex;flex-direction:column;gap:4px;min-width:0}
+.flt label{font-size:9px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:700;white-space:nowrap}
+.flt select,.flt input[type=text],.flt input[type=date]{background:var(--card-2);border:1px solid var(--border);border-radius:9px;padding:8px 10px;color:var(--text);font-family:var(--font-mono);font-size:12px;outline:none;width:100%;box-sizing:border-box}
+.flt select:focus,.flt input:focus{border-color:var(--accent)}
+.srch-wrap{position:relative}
+.srch-wrap i{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:11px;pointer-events:none}
+.srch-wrap input{padding-left:28px}
+.flt-btn{height:37px;padding:0 14px;border-radius:9px;border:0;cursor:pointer;font-family:var(--font-mono);font-size:12px;font-weight:600;white-space:nowrap;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#05121b;display:flex;align-items:center;gap:6px}
+[data-theme=light] .flt-btn{color:#fff}
+.flt-ghost{height:37px;padding:0 12px;border-radius:9px;background:var(--card-2);border:1px solid var(--border);color:var(--text-2);text-decoration:none;font-size:12px;display:flex;align-items:center;gap:6px;white-space:nowrap;cursor:pointer}
+/* ── Summary KPI row ─────────────────────────────────────────── */
+.sumrow{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+.sumc{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:13px 16px;border-top:3px solid var(--c,var(--accent));min-width:0}
+.sumc .l{font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.sumc .v{font-size:24px;font-weight:800;font-family:var(--font-display);color:var(--c,var(--accent));margin-top:3px;line-height:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sumc .s{font-size:9.5px;color:var(--muted);margin-top:3px}
+/* ── Chart grids ─────────────────────────────────────────────── */
+.augrid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px;margin-bottom:12px}
+.augrid-bot{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.cp{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;min-width:0}
+.cp-h{padding:10px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;font-family:var(--font-display);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px}
+.cp-b{padding:12px 14px}.ch-lg{height:215px}.ch-md{height:195px}.ch-sm{height:170px}
+/* ── Table ───────────────────────────────────────────────────── */
+.tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tbl-wrap .data-table{min-width:680px}
+/* ── Export buttons ──────────────────────────────────────────── */
+.export-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.exp-btn{height:34px;padding:0 12px;border-radius:8px;border:1px solid var(--border);background:var(--card-2);color:var(--text-2);font-size:11.5px;font-family:var(--font-mono);font-weight:600;text-decoration:none;display:inline-flex;align-items:center;gap:6px;cursor:pointer;transition:var(--transition);white-space:nowrap}
+.exp-btn:hover{border-color:var(--accent);color:var(--accent)}
+.exp-btn.csv i{color:#1fbf7a}.exp-btn.pdf i{color:#ff4757}
+/* ── Responsive ──────────────────────────────────────────────── */
+@media(min-width:1920px){
+  .flt-grid{grid-template-columns:2fr 1fr 1fr 1fr 1fr 1fr;gap:12px}
+  .flt-row2{grid-template-columns:1fr 1fr 1fr 1fr auto auto;gap:12px}
+  .sumrow{gap:16px;grid-template-columns:repeat(4,1fr)}
+  .augrid{gap:16px;grid-template-columns:2fr 1fr 1fr}
+  .augrid-bot{gap:16px;grid-template-columns:1fr 1fr}
+  .ch-lg{height:240px}.ch-md{height:215px}.ch-sm{height:185px}
+  .sumc .v{font-size:26px}
+}
+@media(max-width:1400px){
+  .flt-grid{grid-template-columns:2fr 1fr 1fr 1fr 1fr}
+  .augrid{grid-template-columns:2fr 1fr}
+  .augrid .cp:first-child{grid-column:1/-1}
+}
+@media(max-width:1279px){
+  .flt-grid{grid-template-columns:1fr 1fr 1fr}
+  .flt-row2{grid-template-columns:1fr 1fr auto auto}
+  .augrid{grid-template-columns:1fr 1fr}
+  .augrid .cp:first-child{grid-column:1/-1}
+  .sumrow{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:1023px){
+  .augrid{grid-template-columns:1fr}
+  .augrid-bot{grid-template-columns:1fr}
+  .ch-lg{height:195px}.ch-md{height:175px}.ch-sm{height:155px}
+}
+@media(max-width:767px){
+  .flt-grid{grid-template-columns:1fr 1fr}
+  .flt-row2{grid-template-columns:1fr 1fr}
+  .sumrow{grid-template-columns:1fr 1fr}
+  .sumc .v{font-size:20px}
+  .ch-lg{height:175px}.ch-md{height:160px}.ch-sm{height:140px}
+  .panel-head{flex-wrap:wrap;gap:8px}
+  .export-bar{width:100%}
+}
+@media(max-width:479px){
+  .flt-grid{grid-template-columns:1fr}
+  .flt-row2{grid-template-columns:1fr}
+  .sumrow{grid-template-columns:1fr 1fr;gap:8px}
+  .sumc{padding:10px 12px}
+  .sumc .v{font-size:18px}
+}
+</style>
+<div class="app">
+<?php include __DIR__ . '/includes/_sidebar.php'; ?>
+<div class="content">
+<?php include __DIR__ . '/includes/_topbar.php'; ?>
+<main class="page">
+
+<!-- ================================================================ FILTERS -->
+<form class="flt" method="get" id="fltForm">
+  <!-- Row 1: search + dropdowns -->
+  <div class="flt-grid">
+    <div class="fg">
+      <label><i class="fa-solid fa-magnifying-glass"></i> Search</label>
+      <div class="srch-wrap">
+        <i class="fa-solid fa-magnifying-glass"></i>
+        <input type="text" name="search" placeholder="Audit ID, operator, line, model…" value="<?= e($fSearch) ?>">
+      </div>
+    </div>
+    <div class="fg"><label><i class="fa-solid fa-user"></i> Auditor</label>
+      <select name="auditor"><option value="">All</option>
+        <?php foreach($optAuditors as $o): ?><option <?= $fAuditor===$o?'selected':'' ?>><?= e($o) ?></option><?php endforeach; ?>
+      </select></div>
+    <div class="fg"><label><i class="fa-solid fa-industry"></i> Line</label>
+      <select name="line"><option value="">All</option>
+        <?php foreach($optLines as $o): ?><option <?= $fLine===$o?'selected':'' ?>><?= e($o) ?></option><?php endforeach; ?>
+      </select></div>
+    <div class="fg"><label><i class="fa-solid fa-boxes-stacked"></i> Model</label>
+      <select name="model"><option value="">All</option>
+        <?php foreach($optModels as $o): ?><option <?= $fModel===$o?'selected':'' ?>><?= e($o) ?></option><?php endforeach; ?>
+      </select></div>
+    <div class="fg"><label><i class="fa-solid fa-clock"></i> Shift</label>
+      <select name="shift"><option value="">All</option>
+        <?php foreach($optShifts as $o): ?><option <?= $fShift===$o?'selected':'' ?>><?= e($o) ?></option><?php endforeach; ?>
+      </select></div>
+    <div class="fg"><label><i class="fa-solid fa-tag"></i> Type</label>
+      <select name="type"><option value="">All</option>
+        <?php foreach($optTypes as $o): ?><option <?= $fType===$o?'selected':'' ?>><?= e($o) ?></option><?php endforeach; ?>
+      </select></div>
+  </div>
+  <!-- Row 2: dates + result + actions -->
+  <div class="flt-row2">
+    <div class="fg"><label>From Date</label><input type="date" name="date_from" value="<?= e($fFrom) ?>"></div>
+    <div class="fg"><label>To Date</label><input type="date" name="date_to" value="<?= e($fTo) ?>"></div>
+    <div class="fg"><label><i class="fa-solid fa-circle-check"></i> Result</label>
+      <select name="result"><option value="">All</option>
+        <option value="pass" <?= $fResult==='pass'?'selected':'' ?>>Clean (0 NG)</option>
+        <option value="fail" <?= $fResult==='fail'?'selected':'' ?>>Has NG</option>
+      </select></div>
+    <div class="fg" style="visibility:hidden"><label>&nbsp;</label></div>
+    <button class="flt-btn" type="submit"><i class="fa-solid fa-filter"></i> Apply</button>
+    <?php if($hasFilter): ?>
+      <a class="flt-ghost" href="audits.php"><i class="fa-solid fa-xmark"></i> Clear</a>
+    <?php endif; ?>
+  </div>
+</form>
+
+<!-- ============================================================= KPI STRIP -->
+<div class="sumrow">
+  <div class="sumc" style="--c:var(--accent)">
+    <div class="l"><i class="fa-solid fa-clipboard-list"></i> Filtered Audits</div>
+    <div class="v"><?= number_format($sum['total']) ?></div>
+    <div class="s">of all-time records</div>
+  </div>
+  <div class="sumc" style="--c:var(--green)">
+    <div class="l"><i class="fa-solid fa-circle-check"></i> Avg Pass Rate</div>
+    <div class="v"><?= $sum['avg_pass'] ?>%</div>
+    <div class="s"><?= $cleanRate ?>% fully clean</div>
+  </div>
+  <div class="sumc" style="--c:var(--red)">
+    <div class="l"><i class="fa-solid fa-triangle-exclamation"></i> Total NG</div>
+    <div class="v"><?= number_format($sum['total_ng']) ?></div>
+    <div class="s">across filtered audits</div>
+  </div>
+  <div class="sumc" style="--c:var(--accent-2)">
+    <div class="l"><i class="fa-solid fa-star"></i> Clean Audits</div>
+    <div class="v"><?= $cleanRate ?>%</div>
+    <div class="s"><?= number_format($sum['clean']) ?> of <?= number_format($sum['total']) ?></div>
+  </div>
+</div>
+
+<!-- ============================================================= CHART ROW 1 -->
+<div class="augrid">
+  <div class="cp">
+    <div class="cp-h">Audits &amp; Avg Pass Rate Over Time</div>
+    <div class="cp-b"><div class="ch-lg"><canvas id="cTime"></canvas></div></div>
+  </div>
+  <div class="cp">
+    <div class="cp-h">Top Lines by NG Count <span style="font-weight:400;font-size:10px;color:var(--muted)">· click a bar to see stage breakdown</span></div>
+    <div class="cp-b"><div class="ch-md"><canvas id="cLineNg"></canvas></div></div>
+  </div>
+  <!-- Stage drilldown panel — hidden until a line bar is clicked -->
+  <div class="cp" id="lineNgDrill" style="display:none">
+    <div class="cp-h" id="lineNgDrillTitle">Stage breakdown</div>
+    <div class="cp-b"><div class="ch-md"><canvas id="cLineNgDrill"></canvas></div></div>
+  </div>
+  <div class="cp">
+    <div class="cp-h">Audit Type Split</div>
+    <div class="cp-b"><div class="ch-md"><canvas id="cType"></canvas></div></div>
+  </div>
+  <div class="cp">
+    <div class="cp-h">Overall Stage NG Distribution</div>
+    <div class="cp-b"><div class="ch-md"><canvas id="cStageAll"></canvas></div></div>
+  </div>
+</div>
+
+<!-- ============================================================= CHART ROW 2 -->
+<div class="augrid-bot">
+  <div class="cp">
+    <div class="cp-h">Pass-Rate Distribution</div>
+    <div class="cp-b"><div class="ch-sm"><canvas id="cBand"></canvas></div></div>
+  </div>
+  <div class="cp">
+    <div class="cp-h">NG per Operator <span style="font-weight:400;font-size:10px;color:var(--muted)">· click a bar for stage breakdown</span></div>
+    <div class="cp-b"><div class="ch-sm"><canvas id="cOp"></canvas></div></div>
+  </div>
+  <div class="cp" id="opDrill" style="display:none">
+    <div class="cp-h" id="opDrillTitle">Stage breakdown — operator</div>
+    <div class="cp-b"><div class="ch-sm"><canvas id="cOpDrill"></canvas></div></div>
+  </div>
+</div>
+
+<!-- ============================================================= RECORDS TABLE -->
+<div class="panel">
+  <div class="panel-head" style="flex-wrap:wrap;gap:10px">
+    <div>
+      <div class="panel-title">Records</div>
+      <div class="panel-sub"><?= count($rows) ?> shown<?= count($rows)>=300?' &nbsp;(capped at 300 — use export for all)':'' ?></div>
+    </div>
+    <div class="export-bar" style="margin-left:auto">
+      <a class="exp-btn csv" href="<?= e($csvUrl) ?>" title="Download CSV">
+        <i class="fa-solid fa-file-csv"></i> CSV
+      </a>
+      <a class="exp-btn pdf" href="#" id="btnPdf" title="Save as PDF">
+        <i class="fa-solid fa-file-pdf"></i> PDF
+      </a>
+      <a class="flt-ghost" href="auditor_history.php" style="height:34px;font-size:11.5px">
+        <i class="fa-solid fa-user-clock"></i> Auditor History
+      </a>
+      <a class="flt-btn" href="audit.php" style="height:34px;font-size:11.5px;text-decoration:none">
+        <i class="fa-solid fa-plus"></i> New Audit
+      </a>
+    </div>
+  </div>
+  <div class="panel-body flush">
+    <div class="tbl-wrap">
+      <table class="data-table" id="auditTable">
+        <thead>
+          <tr>
+            <th>Audit ID</th><th>Type</th><th>Line</th><th>Model</th>
+            <th>Shift</th><th>Operator</th>
+            <th class="text-end">NG</th><th class="text-end">Pass %</th>
+            <th class="text-end">Date</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach ($rows as $r): $pr=(float)$r['pass_rate']; ?>
+            <tr onclick="location.href='report.php?code=<?= urlencode($r['audit_code']) ?>'" style="cursor:pointer">
+              <td class="mono-id"><?= e($r['audit_code']) ?></td>
+              <td><span class="badge-pill badge-muted"><?= e($r['audit_type']) ?></span></td>
+              <td><?= e($r['line']) ?></td>
+              <td style="font-size:11px;color:var(--text-2)"><?= e($r['model']??'—') ?></td>
+              <td class="text-muted"><?= e($r['shift']) ?></td>
+              <td class="text-muted"><?= e($r['operator']) ?></td>
+              <td class="text-end <?= $r['ng_count']>0?'num-bad':'num-good' ?>"><?= (int)$r['ng_count'] ?></td>
+              <td class="text-end" style="color:<?= $pr>=90?'var(--green)':($pr>=75?'var(--amber)':'var(--red)') ?>;font-weight:600"><?= e($r['pass_rate']) ?>%</td>
+              <td class="text-end text-muted"><?= fmt_dt($r['created_at'],'d M Y') ?></td>
+            </tr>
+          <?php endforeach; ?>
+          <?php if (!$rows): ?>
+            <tr><td colspan="9" style="padding:30px;text-align:center;color:var(--muted)">
+              No audits match these filters. <a href="audits.php">Clear filters</a>.</td></tr>
+          <?php endif; ?>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+</main>
+</div>
+</div>
+
+<script>
+/* ================================================================ DATA */
+const ACH = <?= json_encode($CHART, JSON_UNESCAPED_SLASHES) ?>;
+const C = {accent:'#00d4ff',green:'#00e5a0',amber:'#ffb340',red:'#ff4757',purple:'#0F5FA6',blue:'#4d8dff'};
+const PAL = [C.green,C.accent,C.amber,C.red];
+
+/* ================================================================ PDF EXPORT */
+document.getElementById('btnPdf').addEventListener('click', function(e){
+  e.preventDefault();
+  var title = 'QATS Audit Records — <?= e(date('d M Y')) ?>';
+  var rows  = [];
+  document.querySelectorAll('#auditTable tbody tr').forEach(function(tr){
+    var cells = [];
+    tr.querySelectorAll('td').forEach(function(td){ cells.push(td.innerText.trim()); });
+    if(cells.length>1) rows.push(cells);
+  });
+  // Build a minimal self-contained HTML page and print it
+  var head = ['Audit ID','Type','Line','Model','Shift','Operator','NG','Pass %','Date'];
+  var thtml = '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:Arial,sans-serif">'
+    +'<thead><tr>'+head.map(h=>'<th style="border:1px solid #ddd;padding:6px 8px;background:#1a2535;color:#fff;text-align:left">'+h+'</th>').join('')+'</tr></thead>'
+    +'<tbody>'+rows.map((r,i)=>'<tr style="background:'+(i%2===0?'#f8f9fa':'#fff')+'">'+r.map(c=>'<td style="border:1px solid #ddd;padding:5px 8px">'+c+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+  var kpis = '<?= "Total: ".number_format($sum['total'])." | Avg Pass: ".$sum['avg_pass']."% | Total NG: ".number_format($sum['total_ng'])." | Clean: ".$cleanRate."%" ?>';
+  var w = window.open('','_blank');
+  w.document.write('<!DOCTYPE html><html><head><title>'+title+'</title>'
+    +'<style>body{margin:20px;font-family:Arial,sans-serif}h2{font-size:15px;margin:0 0 6px}p{font-size:11px;color:#666;margin:0 0 14px}</style></head>'
+    +'<body><h2>'+title+'</h2><p>Filters applied · '+kpis+'</p>'+thtml+'</body></html>');
+  w.document.close();
+  setTimeout(function(){ w.print(); }, 400);
+});
+
+/* ================================================================ CHARTS */
+document.addEventListener('DOMContentLoaded', function(){
+  if(!window.Chart) return;
+  const css = n => getComputedStyle(document.body).getPropertyValue(n).trim();
+  Chart.defaults.font.family = "'JetBrains Mono',monospace";
+  Chart.defaults.font.size   = 10;
+  Chart.defaults.color       = css('--muted');
+
+  function mk(id, cfg){
+    const el = document.getElementById(id);
+    if(!el) return;
+    try{ new Chart(el, cfg); } catch(err){ console.warn(id, err.message); }
+  }
+  function yFloor(a){
+    const v = (a||[]).filter(x => x != null);
+    if(!v.length) return 0;
+    return Math.max(0, Math.floor((Math.min(...v) - 5) / 10) * 10);
+  }
+  const grid = css('--border'), tx = css('--muted'), card = css('--card');
+
+  /* Chart 1 — Time trend (bar + line) */
+  if(ACH.time_labels.length){
+    mk('cTime', {data:{labels:ACH.time_labels, datasets:[
+      {type:'bar',  label:'Audits', data:ACH.time_cnt, backgroundColor:'rgba(139,92,246,.5)', borderRadius:4, maxBarThickness:26, yAxisID:'y'},
+      {type:'line', label:'Pass %', data:ACH.time_pr,  borderColor:C.accent, backgroundColor:'rgba(0,212,255,.1)', tension:.4, fill:true, pointRadius:2, yAxisID:'y1'}
+    ]}, options:{responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{display:true, labels:{boxWidth:10,font:{size:9}}}},
+      scales:{x:{grid:{display:false}, ticks:{maxTicksLimit:14,color:tx}},
+              y:{grid:{color:grid}, ticks:{color:tx}},
+              y1:{position:'right', min:yFloor(ACH.time_pr), max:100, grid:{display:false}, ticks:{color:tx, callback:v=>v+'%'}}}}});
+  } else {
+    mk('cTime',{type:'bar',data:{labels:['No data'],datasets:[{data:[0],backgroundColor:'rgba(120,120,120,.15)'}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}}}});
+  }
+
+  /* Chart 2 — Top lines by NG (horizontal bar) */
+  /* ── Line NG chart with stage-breakdown drilldown on click ── */
+  var stageByLine = ACH.stage_by_line || {};
+  var lineChartObj = null;
+  // Stage-breakdown panel (hidden until a bar is clicked)
+  var drillDiv = document.getElementById('lineNgDrill');
+  var drillChart = null;
+
+  function showDrill(lineName) {
+    var stageData = stageByLine[lineName] || [];
+    if (!stageData.length || !drillDiv) return;
+    drillDiv.style.display = '';
+    document.getElementById('lineNgDrillTitle').textContent = 'Stage breakdown — ' + lineName;
+    var labels = stageData.map(function(d){ return d.stage; });
+    var values = stageData.map(function(d){ return d.count; });
+    var palette = ['rgba(255,71,87,.8)','rgba(255,179,64,.8)','rgba(148,0,255,.8)','rgba(0,210,255,.8)','rgba(31,191,122,.8)','rgba(77,141,255,.8)'];
+    var canvas = document.getElementById('cLineNgDrill');
+    if (!canvas) return;
+    if (drillChart) { drillChart.destroy(); drillChart = null; }
+    drillChart = new Chart(canvas, { type:'bar',
+      data:{ labels:labels, datasets:[{label:'NGs',data:values,
+             backgroundColor:palette.slice(0,labels.length),borderRadius:5,maxBarThickness:36}] },
+      options:{responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{display:false},title:{display:false}},
+        scales:{x:{grid:{display:false},ticks:{color:tx}},
+                y:{grid:{color:grid},ticks:{color:tx,precision:0}}}}
+    });
+  }
+
+  if (ACH.line_labels && ACH.line_labels.length) {
+    lineChartObj = new Chart(document.getElementById('cLineNg'), { type:'bar',
+      data:{labels:ACH.line_labels, datasets:[{label:'NG',data:ACH.line_ng,
+        backgroundColor:'rgba(255,71,87,.65)', borderRadius:3, maxBarThickness:18,
+        hoverBackgroundColor:'rgba(255,71,87,.9)'}]},
+      options:{responsive:true, maintainAspectRatio:false, indexAxis:'y',
+        plugins:{legend:{display:false}, tooltip:{callbacks:{
+          label:function(ctx){
+            var line = ctx.label;
+            var stages = stageByLine[line] || [];
+            var lines2 = [' Total NG: '+ctx.raw];
+            stages.slice(0,4).forEach(function(d){ lines2.push(' '+d.stage+': '+d.count); });
+            return lines2;
+          }
+        }}},
+        scales:{x:{grid:{color:grid},ticks:{color:tx,precision:0}},
+                y:{grid:{display:false},ticks:{color:tx,font:{size:9}}}},
+        onClick:function(evt, els){
+          if (!els.length) return;
+          var idx = els[0].index;
+          var lineName = ACH.line_labels[idx];
+          showDrill(lineName);
+        }
+      }
+    });
+  } else {
+    var noNgEl = document.getElementById('cLineNg');
+    if (noNgEl) noNgEl.parentNode.innerHTML='<p style="color:var(--muted);text-align:center;padding:32px;font-size:12px">No NG data in this period.</p>';
+  }
+
+  /* Chart 3 — Audit type doughnut */
+  if(ACH.type_labels.length){
+    const tot = ACH.type_cnt.reduce((a,b)=>a+b,0)||1;
+    mk('cType', {type:'doughnut', data:{labels:ACH.type_labels, datasets:[{
+        data:ACH.type_cnt, backgroundColor:[C.accent,C.purple,C.green,C.amber,C.red,C.blue],
+        borderColor:card, borderWidth:3, hoverOffset:5}]},
+      options:{responsive:true, maintainAspectRatio:false, cutout:'58%',
+        plugins:{legend:{display:true, position:'right', labels:{boxWidth:10,font:{size:9}}},
+          tooltip:{callbacks:{label:c=>`${c.label}: ${c.parsed} (${Math.round(c.parsed/tot*100)}%)`}}}}});
+  }
+
+  /* Chart: Overall stage NG distribution */
+  if (ACH.stage_labels && ACH.stage_labels.length) {
+    var stageColors = ['rgba(255,71,87,.75)','rgba(255,179,64,.75)','rgba(148,0,255,.75)','rgba(0,210,255,.75)','rgba(31,191,122,.75)','rgba(77,141,255,.75)'];
+    mk('cStageAll', {type:'bar',
+      data:{labels:ACH.stage_labels,
+            datasets:[{label:'Total NGs',data:ACH.stage_ng_all,
+              backgroundColor:stageColors.slice(0,ACH.stage_labels.length),borderRadius:5,maxBarThickness:36}]},
+      options:{responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){return ' NGs: '+c.raw;}}}},
+        scales:{x:{grid:{display:false},ticks:{color:tx,font:{size:10}}},
+                y:{grid:{color:grid},ticks:{color:tx,precision:0}}}}
+    });
+  } else {
+    var el=document.getElementById('cStageAll');
+    if(el) el.parentNode.innerHTML='<p style="color:var(--muted);text-align:center;padding:28px;font-size:12px">No NG stage data yet.</p>';
+  }
+
+  /* Chart 4 — Pass-rate band bar */
+  const bandLabels = ['≥95% (Excellent)','90–95% (Good)','75–90% (Avg)','<75% (Poor)'];
+  const bandCols   = ['rgba(0,229,160,.7)','rgba(0,212,255,.7)','rgba(255,179,64,.7)','rgba(255,71,87,.7)'];
+  mk('cBand', {type:'bar', data:{labels:bandLabels, datasets:[{label:'Audits', data:ACH.band,
+      backgroundColor:bandCols, borderRadius:5, maxBarThickness:40}]},
+    options:{responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{x:{grid:{display:false}, ticks:{color:tx,font:{size:9}}}, y:{grid:{color:grid}, ticks:{color:tx}}}}});
+
+  /* ── NG per Operator — server-side data, click for stage drilldown ── */
+  var stageByOp = ACH.stage_by_op || {};
+  var opDrillChart = null;
+
+  function showOpDrill(opName) {
+    var data   = stageByOp[opName] || [];
+    var panel  = document.getElementById('opDrill');
+    var title  = document.getElementById('opDrillTitle');
+    var canvas = document.getElementById('cOpDrill');
+    if (!panel || !canvas || !data.length) { if (panel) panel.style.display = 'none'; return; }
+    panel.style.display = '';
+    title.textContent = 'Stage breakdown — ' + opName;
+    var pal = ['rgba(255,71,87,.8)','rgba(255,179,64,.8)','rgba(148,0,255,.8)',
+               'rgba(0,210,255,.8)','rgba(31,191,122,.8)','rgba(77,141,255,.8)'];
+    if (opDrillChart) { opDrillChart.destroy(); opDrillChart = null; }
+    opDrillChart = new Chart(canvas, { type:'bar',
+      data:{ labels: data.map(function(d){ return d.stage; }),
+             datasets:[{ label:'NGs', data: data.map(function(d){ return d.count; }),
+               backgroundColor: pal.slice(0, data.length), borderRadius:5, maxBarThickness:36 }] },
+      options:{ responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{display:false} },
+        scales:{ x:{grid:{display:false},ticks:{color:tx}}, y:{grid:{color:grid},ticks:{color:tx,precision:0}} } }
+    });
+  }
+
+  if (ACH.op_labels && ACH.op_labels.length) {
+    new Chart(document.getElementById('cOp'), { type:'bar',
+      data:{ labels: ACH.op_labels,
+             datasets:[{ label:'Total NG', data: ACH.op_ng,
+               backgroundColor:'rgba(139,92,246,.65)', borderRadius:4, maxBarThickness:28,
+               hoverBackgroundColor:'rgba(139,92,246,.9)' }] },
+      options:{ responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{display:false},
+          tooltip:{ callbacks:{ label:function(ctx) {
+            var op     = ctx.label;
+            var stages = stageByOp[op] || [];
+            var lines2 = [' Total NG: '+ctx.raw, ' Audits: '+(ACH.op_audits[ctx.dataIndex]||0),
+                          ' Avg Pass: '+(ACH.op_pass[ctx.dataIndex]||0)+'%'];
+            stages.slice(0,4).forEach(function(d){ lines2.push(' '+d.stage+': '+d.count); });
+            return lines2;
+          }}}},
+        scales:{
+          x:{ grid:{display:false}, ticks:{color:tx, maxRotation:30, font:{size:9}} },
+          y:{ grid:{color:grid}, ticks:{color:tx, precision:0} }
+        },
+        onClick:function(evt, els){
+          if (!els.length) return;
+          showOpDrill(ACH.op_labels[els[0].index]);
+        }
+      }
+    });
+  } else {
+    var opEl = document.getElementById('cOp');
+    if (opEl) opEl.parentNode.innerHTML = '<p style="color:var(--muted);text-align:center;padding:28px;font-size:12px">No NG operator data in this period.</p>';
+  }
+});
+</script>
+<?php $ASSET=''; include __DIR__ . '/includes/_foot.php'; ?>
