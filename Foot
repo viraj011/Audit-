@@ -1,0 +1,69 @@
+<?php
+/* ============================================================================
+ *  includes/_foot.php  —  closes </body></html>, wires up theme toggle and
+ *  mobile sidebar drawer if those elements are present on the page.
+ *  ---------------------------------------------------------------------------
+ *  Like helpers.php, this file did not exist anywhere in the delivered
+ *  project files — login.php's `include __DIR__ . '/includes/_foot.php'`
+ *  at the bottom would fail the same way helpers.php's missing
+ *  require_once did, once that first fatal error was fixed. Built to be
+ *  defensive: every selector below is guarded with an existence check
+ *  (`if (el)`) before use, since no includes/_topbar.php with a
+ *  theme-toggle button was found anywhere in this project's delivered
+ *  files either — this way _foot.php works correctly whether a given
+ *  page has that markup or not, rather than throwing a JS console error
+ *  on any page that doesn't.
+ * ==========================================================================*/
+?>
+<script>
+(function () {
+  'use strict';
+
+  /* Theme toggle — persists to a cookie so _head.php's server-side
+     data-theme attribute matches on the very next page load, avoiding
+     a flash of the wrong theme before JS runs. */
+  var themeBtn = document.querySelector('[data-theme-toggle]') || document.getElementById('themeToggle');
+  if (themeBtn) {
+    themeBtn.addEventListener('click', function () {
+      var html = document.documentElement;
+      var next = html.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+      html.setAttribute('data-theme', next);
+      document.cookie = 'qats_theme=' + next + ';path=/;max-age=' + (60 * 60 * 24 * 365);
+    });
+  }
+
+  /* Mobile sidebar drawer — toggle button + scrim backdrop, matching
+     the .sidebar / #scrim / [data-sidebar-toggle] markup used in
+     includes/_sidebar.php. Guarded the same way: does nothing if this
+     page doesn't have a sidebar (e.g. login.php itself has neither). */
+  var sidebar     = document.getElementById('sidebar');
+  var scrim       = document.getElementById('scrim');
+  var drawerToggle = document.querySelector('[data-sidebar-toggle]') || document.getElementById('sidebarToggle');
+
+  function openDrawer() {
+    if (sidebar) sidebar.classList.add('open');
+    if (scrim)   scrim.classList.add('show');
+  }
+  function closeDrawer() {
+    if (sidebar) sidebar.classList.remove('open');
+    if (scrim)   scrim.classList.remove('show');
+  }
+
+  if (drawerToggle) drawerToggle.addEventListener('click', openDrawer);
+  if (scrim)         scrim.addEventListener('click', closeDrawer);
+
+  /* Auto-dismiss success/info alerts after a few seconds — same pattern
+     already used inline on several pages built earlier in this
+     project (nc_rca.php, nc_verify.php); centralised here so every
+     page gets it without repeating the snippet. */
+  document.querySelectorAll('.alert-success, .alert-info').forEach(function (a) {
+    setTimeout(function () {
+      a.style.transition = 'opacity .5s';
+      a.style.opacity = '0';
+      setTimeout(function () { a.remove(); }, 500);
+    }, 4000);
+  });
+})();
+</script>
+</body>
+</html>
