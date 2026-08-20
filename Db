@@ -1,0 +1,140 @@
+<?php
+/* ============================================================================
+ *  config/db.php  —  one reusable PDO connection for the whole app
+ *  ---------------------------------------------------------------------------
+ *  Edit the four constants below to match your MySQL server, then every page
+ *  just calls db() to get the shared connection.
+ * ==========================================================================*/
+
+const DB_HOST = '127.0.0.1';
+const DB_NAME = 'qats';
+const DB_USER = 'root';
+const DB_PASS = '';          // ← set your MySQL password here
+
+function db(): PDO
+{
+    static $pdo = null;       // connect once, reuse for every query
+    if ($pdo === null) {
+        $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4';
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ]);
+        qats_auto_migrate($pdo);   // self-heal Model Master schema (idempotent, runs once)
+    }
+    return $pdo;
+}
+
+/* ----------------------------------------------------------------------------
+ *  qats_auto_migrate() — brings an older database up to the Model Master schema
+ *  without the admin having to run any SQL by hand. Every step is guarded and
+ *  idempotent: missing columns/tables are added; if they already exist nothing
+ *  happens. Safe to run on every connection (the checks are cheap), but a
+ *  static guard keeps it to once per request.
+ * --------------------------------------------------------------------------*/
+function qats_auto_migrate(PDO $pdo): void
+{
+    static $done = false;
+    if ($done) return;
+    $done = true;
+
+    try {
+        $hasCol = function (string $table, string $col) use ($pdo): bool {
+            $st = $pdo->prepare(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?");
+            $st->execute([$table, $col]);
+            return (bool) $st->fetchColumn();
+        };
+        $tableExists = function (string $table) use ($pdo): bool {
+            $st = $pdo->prepare(
+                "SELECT COUNT(*) FROM information_schema.TABLES
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?");
+            $st->execute([$table]);
+            return (bool) $st->fetchColumn();
+        };
+
+        // models table may not exist on a very old DB — skip silently if so
+        if ($tableExists('models')) {
+            $modelCols = [
+                'line'          => "ADD COLUMN line VARCHAR(60) DEFAULT NULL",
+                'std_thickness' => "ADD COLUMN std_thickness DECIMAL(6,3) DEFAULT NULL",
+                'lsl'           => "ADD COLUMN lsl DECIMAL(6,3) DEFAULT NULL",
+                'usl'           => "ADD COLUMN usl DECIMAL(6,3) DEFAULT NULL",
+                'source'        => "ADD COLUMN source ENUM('manual','excel','review') NOT NULL DEFAULT 'manual'",
+                'created_at'    => "ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            ];
+            foreach ($modelCols as $col => $ddl) {
+                if (!$hasCol('models', $col)) { try { $pdo->exec("ALTER TABLE models $ddl"); } catch (Throwable $e) {} }
+            }
+        }
+
+        if ($tableExists('audits') && !$hasCol('audits', 'pcb_thickness')) {
+            try { $pdo->exec("ALTER TABLE audits ADD COLUMN pcb_thickness DECIMAL(6,3) DEFAULT NULL"); } catch (Throwable $e) {}
+        }
+
+        /* FIX: analytics.php and analytics2.php both SELECT a.block, but the
+         * column was never created by the schema or by any migration, so both
+         * pages died with "Unknown column 'a.block'". Added here, then
+         * backfilled from production_lines.block where the line name matches
+         * (falling back to the A–E numeric ranges used across the project) so
+         * existing rows aren't left blank. */
+        if ($tableExists('audits') && !$hasCol('audits', 'block')) {
+            try {
+                $pdo->exec("ALTER TABLE audits ADD COLUMN block VARCHAR(5) DEFAULT NULL AFTER line");
+                if ($tableExists('production_lines')) {
+                    $pdo->exec("UPDATE audits a
+                                JOIN production_lines p ON p.name = a.line
+                                SET a.block = p.block
+                                WHERE a.block IS NULL AND p.block IS NOT NULL");
+                }
+                $pdo->exec("UPDATE audits SET block = CASE
+                        WHEN CAST(REGEXP_SUBSTR(line,'[0-9]+') AS UNSIGNED) BETWEEN 1  AND 14 THEN 'A'
+                        WHEN CAST(REGEXP_SUBSTR(line,'[0-9]+') AS UNSIGNED) BETWEEN 15 AND 29 THEN 'B'
+                        WHEN CAST(REGEXP_SUBSTR(line,'[0-9]+') AS UNSIGNED) BETWEEN 30 AND 44 THEN 'C'
+                        WHEN CAST(REGEXP_SUBSTR(line,'[0-9]+') AS UNSIGNED) BETWEEN 45 AND 55 THEN 'D'
+                        WHEN CAST(REGEXP_SUBSTR(line,'[0-9]+') AS UNSIGNED) BETWEEN 56 AND 62 THEN 'E'
+                        ELSE NULL END
+                    WHERE block IS NULL AND line REGEXP '[0-9]'");
+            } catch (Throwable $e) {}
+        }
+
+        if (!$tableExists('model_review')) {
+            try {
+                $pdo->exec("CREATE TABLE model_review (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(120) NOT NULL,
+                    line VARCHAR(60) DEFAULT NULL,
+                    proposed_thickness DECIMAL(6,3) DEFAULT NULL,
+                    suggested_thickness DECIMAL(6,3) DEFAULT NULL,
+                    confidence TINYINT DEFAULT NULL,
+                    audit_code VARCHAR(24) DEFAULT NULL,
+                    operator VARCHAR(120) DEFAULT NULL,
+                    status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_status (status), INDEX idx_name (name)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+            } catch (Throwable $e) {}
+        }
+
+        if (!$tableExists('thickness_deviations')) {
+            try {
+                $pdo->exec("CREATE TABLE thickness_deviations (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    audit_code VARCHAR(24) DEFAULT NULL,
+                    model VARCHAR(120) NOT NULL,
+                    line VARCHAR(60) DEFAULT NULL,
+                    std_thickness DECIMAL(6,3) DEFAULT NULL,
+                    actual_thickness DECIMAL(6,3) NOT NULL,
+                    delta DECIMAL(6,3) NOT NULL,
+                    status ENUM('within','out_of_spec','blocked') NOT NULL DEFAULT 'within',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_model (model), INDEX idx_status (status), INDEX idx_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+            } catch (Throwable $e) {}
+        }
+    } catch (Throwable $e) {
+        // Never let migration problems break the app — pages can still run.
+    }
+}
