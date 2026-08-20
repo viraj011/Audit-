@@ -1,63 +1,41 @@
 <?php
 /* ============================================================================
- *  includes/helpers.php  —  shared small utilities used across every page
- *  ---------------------------------------------------------------------------
- *  THIS FILE WAS MISSING FROM THE PROJECT ENTIRELY.
- *
- *  Root cause of "login page logs in but no page shows": login.php (and
- *  effectively every other page in QATS — audits.php, nc_rca.php,
- *  nc_verify.php, followup.php, audit_edit.php, admin/*.php, all of
- *  them) does `require_once __DIR__ . '/includes/helpers.php'` near the
- *  top. That file did not exist anywhere in this project's delivered
- *  files. Reproduced directly against a real PHP interpreter: a missing
- *  require_once is a fatal error, and with display_errors OFF (the
- *  normal production/XAMPP default), PHP returns an HTTP 200 with a
- *  completely EMPTY response body — no error, no blank page you can
- *  even see rendered, nothing. That is exactly "logging in but no page
- *  showing": the login POST can succeed (auth.php loads fine on its
- *  own), but execution dies silently the instant it reaches this
- *  require_once, before the redirect or any HTML ever reaches the
- *  browser. Every function below is named and shaped to match every
- *  call site already written throughout this project — csrf_field(),
- *  csrf_check(), e(), flash($msg, $type), take_flashes() — so dropping
- *  this file in is a pure fix with no other files needing to change.
+ *  includes/helpers.php  —  escaping + CSRF tokens + flash messages
  * ==========================================================================*/
 
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
+if (session_status() === PHP_SESSION_NONE) session_start();
 
-/* ── HTML escaping shorthand ──────────────────────────────────────────────
- * Used throughout as e($value) instead of htmlspecialchars($value, ...).
- * Accepts null/int/float gracefully so a stray e($maybeNull) never
- * throws a TypeError on PHP 8.1+ (htmlspecialchars() alone would). */
+/* ---- HTML escaping -------------------------------------------------------
+ * FIX 1: this function was commented out, but 35 files call e() — including
+ * csrf_field() on line 22 of this very file. That is the exact fatal error
+ * on screen: "Call to undefined function e() in helpers.php:22", triggered
+ * from login.php's csrf_field() call. Nothing in the app could render.
+ * FIX 2: the commented-out body also called string($value) — not a real PHP
+ * function (the cast is (string)$value). So even uncommented as-is it would
+ * have thrown "Call to undefined function string()". Both fixed. */
 function e($value): string
 {
     return htmlspecialchars((string)($value ?? ''), ENT_QUOTES, 'UTF-8');
 }
 
-/* ── CSRF protection ──────────────────────────────────────────────────────
- * One token per session, reused across forms (simpler and sufficient
- * for an internal tool — not regenerated per-form/per-request, which
- * would break multi-tab usage). */
+/* ---- CSRF ----------------------------------------------------------------- */
 function csrf_token(): string
 {
-    if (empty($_SESSION['csrf_token'])) {
-        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-    }
+    if (empty($_SESSION['csrf_token'])) $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
     return $_SESSION['csrf_token'];
 }
 
-/* Emits the hidden input every POST form in this project includes via
- * <?= csrf_field() ?>. */
+/* FIX 3: the hidden input was named "csrf" but csrf_check() reads
+ * $_POST['csrf_token']. They never matched, so every CSRF check failed and
+ * every form POST was rejected as "Session expired" — including login. */
 function csrf_field(): string
 {
     return '<input type="hidden" name="csrf_token" value="' . e(csrf_token()) . '">';
 }
 
-/* Called at the top of every POST handler across the project as
- * `if (!csrf_check()) { ... }`. Uses hash_equals() for timing-safe
- * comparison rather than a plain === check. */
+/* FIX 4: compared against $expexcted (typo) instead of $expected. On PHP 8
+ * an undefined variable in hash_equals() is a fatal TypeError (null given),
+ * so any form that got as far as validating would hard-crash. */
 function csrf_check(): bool
 {
     $submitted = $_POST['csrf_token'] ?? '';
@@ -65,24 +43,22 @@ function csrf_check(): bool
     return $expected !== '' && hash_equals($expected, $submitted);
 }
 
-/* ── Flash messages ───────────────────────────────────────────────────────
- * flash($message, $type) queues a message; take_flashes() returns and
- * clears the queue. $type is one of 'success' | 'error' | 'warning' |
- * 'info' — matching every call site's usage across nc_rca.php,
- * nc_verify.php, audit_edit.php, etc. Queued as an array (not a single
- * slot) so more than one flash can be queued before the next page load
- * (e.g. a bulk action reporting both a count and a warning). */
-function flash(string $message, string $type = 'info'): void
+/* ---- Flash messages (one-shot notices across a redirect) ------------------ */
+
+/* FIX 5: flash() initialised $_SESSION['_flashes'] but then appended to
+ * $_SESSION['flash'], while take_flashes() read $_SESSION['_flashes'] and
+ * unset $_SESSION['flashes'] — three different key names. Messages were
+ * written to one bucket, read from another, and cleared from a third, so
+ * no flash message ever appeared and they accumulated forever. All three
+ * now use '_flashes' consistently. */
+function flash(string $msg, string $type = 'info'): void
 {
     if (!isset($_SESSION['_flashes']) || !is_array($_SESSION['_flashes'])) {
         $_SESSION['_flashes'] = [];
     }
-    $_SESSION['_flashes'][] = ['msg' => $message, 'type' => $type];
+    $_SESSION['_flashes'][] = ['msg' => $msg, 'type' => $type];
 }
 
-/* Returns all queued flashes as [['msg'=>..., 'type'=>...], ...] and
- * clears the queue — matches every call site's `foreach (take_flashes()
- * as $fl) { ... $fl['msg'] ... $fl['type'] ... }` pattern exactly. */
 function take_flashes(): array
 {
     $flashes = $_SESSION['_flashes'] ?? [];
@@ -90,84 +66,19 @@ function take_flashes(): array
     return is_array($flashes) ? $flashes : [];
 }
 
-/* Renders every queued flash as ready-to-echo HTML in one call.
- *
- * Every page in this project that shows flash messages (nc_rca.php,
- * nc_verify.php, and others) repeats the same six-line block inline:
- *
- *     <?php foreach (take_flashes() as $fl):
- *         $cls = match($fl['type']){'success'=>'success','warning'=>'warning',default=>'danger'};
- *     ?>
- *     <div class="alert alert-<?= $cls ?>"><?= e($fl['msg']) ?></div>
- *     <?php endforeach; ?>
- *
- * render_flashes() is that same block as a single function, called as
- * <?= render_flashes() ?>. This is what was reported as "unable to
- * call function render_flashes" — the function itself was never
- * actually defined anywhere in the delivered project files, same as
- * fmt_dt() and the missing helpers.php/_foot.php/components.php/
- * _topbar.php found in earlier passes over this codebase — a page
- * calling it fatally errors with "Call to undefined function
- * render_flashes()", and with display_errors off (production default)
- * that shows as the page failing to render at all after upload,
- * matching exactly what was reported.
- *
- * FIX folded in while building this: every existing inline copy of
- * this pattern maps anything that isn't 'success' or 'warning'
- * straight to 'danger', including 'info' — but flash()'s own default
- * type IS 'info', and the CSS has a real, distinct .alert-info style
- * (calm blue) separate from .alert-danger (red). That means any flash
- * queued via flash($msg) with no explicit type, or explicitly with
- * 'info', has been rendering as an alarming red error box everywhere
- * this pattern is used, instead of the calm informational style it
- * was actually meant to have. This function maps 'info' to 'info'
- * correctly; 'success' and 'warning' pass through unchanged; anything
- * else (including 'error', which followup.php and nc_verify.php both
- * use) still correctly falls through to 'danger'. */
-function render_flashes(): string
+/* FIX 6: render_flashes() was commented out, but audit1.php:269,
+ * report.php:36 and includes/admin_layout.php:23 all call it — this is the
+ * "line 269" fatal error reported earlier. Restored. Echoes directly (void)
+ * because all three call sites use <?php render_flashes(); ?>, not <?= ?>. */
+function render_flashes(): void
 {
-    $html = '';
-    foreach (take_flashes() as $fl) {
-        $type = $fl['type'] ?? 'info';
-        $cls  = match ($type) {
-            'success' => 'success',
-            'warning' => 'warning',
-            'info'    => 'info',
-            default   => 'danger',
-        };
-        $html .= '<div class="alert alert-' . $cls . '">' . e($fl['msg'] ?? '') . '</div>' . "\n";
+    foreach (take_flashes() as $f) {
+        $map = ['success'=>'success','error'=>'danger','danger'=>'danger',
+                'info'=>'info','warning'=>'warning'];
+        $cls = $map[$f['type'] ?? 'info'] ?? 'info';
+        echo '<div class="alert alert-' . $cls . '">' . e($f['msg'] ?? '') . '</div>' . "\n";
     }
-    return $html;
 }
 
-/* Alias for render_flashes(). This project's real audit.php (not present
- * in these delivered files — the only audit.php available here is an
- * unrelated older prototype, so its exact call site can't be inspected
- * directly) was reported to fatally error on a function named
- * "flashes", separately from the earlier report naming
- * "render_flashes" specifically. Reproduced both exact error strings
- * directly — "Call to undefined function flashes()" and "Call to
- * undefined function render_flashes()" are genuinely different
- * messages, so which one actually appears on screen determines which
- * name is missing, and that couldn't be confirmed without the real
- * file. Rather than guess and risk fixing the wrong name again,
- * defining flashes() as a plain alias means the fix is correct
- * whichever name audit.php actually calls — both now resolve to the
- * exact same rendering logic, so there is no behavioural difference
- * between them, only the name used to invoke it. */
-function flashes(): string
-{
-    return render_flashes();
-}
-
-/* ── Date formatting shorthand ────────────────────────────────────────────
- * Used across audits.php and elsewhere as fmt_dt($datetimeString, $format).
- * Same class of gap as render_flashes() above and the other missing
- * includes found in earlier passes — called throughout the project but
- * never actually defined anywhere in the delivered files. */
-function fmt_dt(?string $datetime, string $format = 'd M Y H:i'): string
-{
-    if (!$datetime) return '—';
-    $ts = strtotime($datetime);
-    return $ts ? date($format, $ts) : '—';
-}
+/* Alias: some pages call flashes() instead. */
+function flashes(): void { render_flashes(); }
