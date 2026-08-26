@@ -1,0 +1,20 @@
+function login(string $gen_id, string $password): bool
+{
+    $st = db()->prepare("
+        SELECT u.id, u.gen_id, u.name, u.email, u.password_hash, u.status, u.department,
+               r.name AS role, r.label AS role_label, r.can_admin, r.can_audit
+        FROM users u LEFT JOIN roles r ON r.id = u.role_id
+        WHERE u.gen_id = ? LIMIT 1
+    ");
+    $st->execute([$gen_id]);
+    $u = $st->fetch();
+
+    if (!$u || $u['status'] !== 'active' || !password_verify($password, $u['password_hash'])) {
+        return false;
+    }
+    unset($u['password_hash']);
+    $_SESSION['user'] = $u;
+
+    db()->prepare("UPDATE users SET last_login = NOW() WHERE id = ?")->execute([$u['id']]);
+    return true;
+}
