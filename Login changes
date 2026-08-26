@@ -65,3 +65,39 @@ $ASSET = '';
 include __DIR__ . '/includes/_head.php';
 ?>
 
+
+nc rca 
+nc rca
+
+// Dept filter: join audit_results to get department
+// Non-PQC users only see their own dept's NGs.
+// FAIL CLOSED: if a non-PQC account has no department assigned, show
+// nothing rather than silently falling through to "all departments".
+if (!$isPQC) {
+    if ($userDept !== '' && $userDept !== null) {
+        $where[] = "EXISTS (
+            SELECT 1 FROM audit_results ar2
+            WHERE ar2.audit_id = n.audit_id
+              AND ar2.stage = n.stage
+              AND ar2.result = 'NG'
+              AND ar2.department = ?
+        )";
+        $p[] = $userDept;
+    } else {
+        $where[] = '1=0';
+        $errors[] = 'Your account has no department assigned — contact an administrator.';
+    }
+} elseif ($fDept !== '') {
+    $where[] = "EXISTS (
+        SELECT 1 FROM audit_results ar2
+        WHERE ar2.audit_id = n.audit_id
+          AND ar2.stage = n.stage
+          AND ar2.result = 'NG'
+          AND ar2.department = ?
+    )";
+    $p[] = $fDept;
+}
+
+
+
+
