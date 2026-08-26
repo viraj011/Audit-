@@ -1,0 +1,157 @@
+<?php
+/* ============================================================================
+ *  repeat_defects.php — Repeat Defect / RCA-effectiveness tracking
+ *  ---------------------------------------------------------------------------
+ *  Flags (line, defect_type) pairs where a new NC opened AFTER a prior NC
+ *  with the same line + defect_type was already closed. A high repeat rate
+ *  means the corrective action on file isn't actually preventing recurrence
+ *  — this is a plain SQL join, not a model, so it's exact, not probabilistic.
+ *
+ *  PLACEMENT: this is written as a standalone page (own require/auth block,
+ *  matching nc_rca.php's pattern) so it can be dropped in and linked from
+ *  _sidebar.php once you decide where it belongs. If you'd rather have this
+ *  as a panel appended to an existing page (e.g. analytics.php) instead of
+ *  its own page, paste that file and this can be adapted to fit inline.
+ * ==========================================================================*/
+
+require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/helpers.php';
+require_once __DIR__ . '/includes/components.php';
+requireLogin();
+
+$db = db();
+$me = currentUser();
+
+// Only PQC/admin should see this cross-department view. Non-PQC users
+// (department tier) don't get a repeat-defect page — repeats only make
+// sense in aggregate across their own history, and cross-line comparison
+// is a PQC-level concern. Adjust this gate if that's not the intent.
+$userRole = strtolower($me['role'] ?? '');
+$userDept = $me['department'] ?? '';
+$isPQC = !empty($me['can_admin'])
+      || in_array($userRole, ['admin', 'pqc', 'quality', 'quality manager'], true)
+      || in_array(strtolower($userDept), ['pqc', 'quality', 'qa'], true);
+
+if (!$isPQC) {
+    header('Location: ' . (function_exists('base_path') ? base_path() : '') . 'dashboard.php');
+    exit;
+}
+
+// ── Repeat-defect query ───────────────────────────────────────────────────
+// For each NC, mark it as a "repeat" if a prior CLOSED NC with the same
+// line + defect_type exists before it opened. Then aggregate.
+$repeatRows = [];
+try {
+    $repeatRows = $db->query("
+        SELECT n.line, n.defect_type,
+               COUNT(*) AS total_occurrences,
+               SUM(CASE WHEN EXISTS (
+                   SELECT 1 FROM nonconformities prior
+                   WHERE prior.line = n.line
+                     AND prior.defect_type = n.defect_type
+                     AND prior.closed_at IS NOT NULL
+                     AND prior.closed_at < n.opened_at
+                     AND prior.id != n.id
+               ) THEN 1 ELSE 0 END) AS repeat_occurrences,
+               MAX(n.opened_at) AS last_seen
+        FROM nonconformities n
+        GROUP BY n.line, n.defect_type
+        HAVING total_occurrences >= 2
+        ORDER BY repeat_occurrences DESC, total_occurrences DESC
+    ")->fetchAll();
+} catch (Throwable $e) {
+    $repeatRows = [];
+}
+
+$totalPairs   = count($repeatRows);
+$worstRate    = 0;
+$totalRepeats = 0;
+foreach ($repeatRows as $r) {
+    $rate = $r['total_occurrences'] > 0
+        ? (int)round($r['repeat_occurrences'] / $r['total_occurrences'] * 100)
+        : 0;
+    $worstRate     = max($worstRate, $rate);
+    $totalRepeats += (int)$r['repeat_occurrences'];
+}
+
+$PAGE_TITLE   = 'Repeat Defects';
+$PAGE_HEADING = 'Repeat Defect Tracking';
+$PAGE_SUB     = 'Which corrective actions are actually preventing recurrence';
+$ACTIVE       = 'repeat_defects';
+$ASSET        = '';
+include __DIR__ . '/includes/_head.php';
+?>
+<div class="app">
+<?php include __DIR__ . '/includes/_sidebar.php'; ?>
+<div class="content">
+<?php include __DIR__ . '/includes/_topbar.php'; ?>
+<main class="page">
+<?php render_flashes(); ?>
+
+<style>
+.rd-kpi-strip{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
+.rd-kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:13px 15px;text-align:center}
+.rd-kpi-label{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
+.rd-kpi-val{font-size:26px;font-weight:800;line-height:1}
+@media(max-width:760px){.rd-kpi-strip{grid-template-columns:1fr}}
+</style>
+
+<div class="rd-kpi-strip">
+  <div class="rd-kpi">
+    <div class="rd-kpi-label">Defect Patterns Tracked</div>
+    <div class="rd-kpi-val"><?= (int)$totalPairs ?></div>
+  </div>
+  <div class="rd-kpi">
+    <div class="rd-kpi-label">Total Repeat Occurrences</div>
+    <div class="rd-kpi-val"><?= (int)$totalRepeats ?></div>
+  </div>
+  <div class="rd-kpi">
+    <div class="rd-kpi-label">Worst Repeat Rate</div>
+    <div class="rd-kpi-val"><?= (int)$worstRate ?>%</div>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="panel-head">
+    <div class="panel-title">Repeat Defects by Line</div>
+    <span class="panel-sub"><?= count($repeatRows) ?> patterns</span>
+  </div>
+  <div class="panel-body flush">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Line</th>
+          <th>Defect Type</th>
+          <th>Total Occurrences</th>
+          <th>Repeats</th>
+          <th>Repeat Rate</th>
+          <th>Last Seen</th>
+        </tr>
+      </thead>
+      <tbody>
+        <?php if ($repeatRows): foreach ($repeatRows as $r):
+              $rate = $r['total_occurrences'] > 0
+                  ? (int)round($r['repeat_occurrences'] / $r['total_occurrences'] * 100)
+                  : 0;
+              $cls = $rate >= 50 ? 'badge-red' : ($rate >= 25 ? 'badge-amber' : 'badge-green');
+        ?>
+        <tr>
+          <td><?= e($r['line']) ?></td>
+          <td><?= e($r['defect_type']) ?></td>
+          <td><?= (int)$r['total_occurrences'] ?></td>
+          <td><?= (int)$r['repeat_occurrences'] ?></td>
+          <td><span class="badge-pill <?= $cls ?>"><?= $rate ?>%</span></td>
+          <td><?= e(substr((string)$r['last_seen'], 0, 16)) ?></td>
+        </tr>
+        <?php endforeach; else: ?>
+        <tr><td colspan="6" class="text-muted" style="padding:18px">No repeat patterns yet.</td></tr>
+        <?php endif; ?>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</main>
+</div>
+</div>
+<?php $ASSET = ''; include __DIR__ . '/includes/_foot.php'; ?>
