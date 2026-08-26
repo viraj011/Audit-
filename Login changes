@@ -18,3 +18,50 @@ function login(string $gen_id, string $password): bool
     db()->prepare("UPDATE users SET last_login = NOW() WHERE id = ?")->execute([$u['id']]);
     return true;
 }
+
+<?php
+/* ============================================================================
+ *  login.php — sign in. Verifies against the users table via auth.php.
+ * ==========================================================================*/
+require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/helpers.php';
+
+/* Where a signed-in user should land: department-tier users go straight
+ * to NC Follow-up & RCA (their only reachable page); everyone else goes
+ * to the normal audit entry screen. */
+function post_login_redirect(array $u): string
+{
+    $isPQC = !empty($u['can_admin'])
+          || in_array(strtolower($u['role'] ?? ''), ['admin', 'pqc', 'quality', 'quality manager'], true)
+          || in_array(strtolower($u['department'] ?? ''), ['pqc', 'quality', 'qa'], true);
+
+    if (!$isPQC && !empty($u['department'])) {
+        return 'nc_rca.php';
+    }
+    return 'audit.php';
+}
+
+if (currentUser()) {
+    header('Location: ' . post_login_redirect(currentUser()));
+    exit;
+}
+
+$error = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!csrf_check()) {
+        $error = 'Session expired — please try again.';
+    } else {
+        $gen_id = trim($_POST['gen_id'] ?? '');
+        $pass  = $_POST['password'] ?? '';
+        if (login($gen_id, $pass)) {
+            header('Location: ' . post_login_redirect(currentUser()));
+            exit;
+        }
+        $error = 'Invalid GEN ID or password.';
+    }
+}
+$PAGE_TITLE = 'Sign in';
+$ASSET = '';
+include __DIR__ . '/includes/_head.php';
+?>
+
