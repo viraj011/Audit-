@@ -16,6 +16,16 @@
  *    - audit_results    (department, remark columns — already added via updates.sql)
  *    - rca_entries      (full RCA data — auto-created by qats_auto_migrate)
  *    - audits           (for audit meta: model, shift, block, audit_code)
+ *
+ *  FIX (this version): department matching previously joined only on
+ *  (audit_id, stage). A single stage can contain multiple checkpoints
+ *  (`param`) owned by DIFFERENT departments, so matching on stage alone
+ *  let ANY department's NG on a shared stage satisfy the match — leaking
+ *  NCs that belonged to a different department's checkpoint on that same
+ *  stage. Fixed by also matching ar.param = n.defect_type (the same join
+ *  key already used elsewhere in this file for the rca_entries link), in
+ *  both the department filter (list query) and the RCA-save ownership
+ *  check, since both had the identical flaw.
  * ===========================================================================*/
 
 require_once __DIR__ . '/includes/auth.php';
@@ -28,22 +38,17 @@ $db  = db();
 $me  = currentUser();
 
 // ── Dept / role detection ────────────────────────────────────────────────────
-// In the real QATS users table there is no "department" column by default —
-// the role name IS the department key. We treat can_admin roles as PQC.
-$userRole    = strtolower($me['role']       ?? '');
+// department column now exists on users table (added via auth.php migration).
+// isPQC = can_admin OR role is quality/pqc OR department is PQC/Quality.
+$userRole      = strtolower($me['role']       ?? '');
 $userRoleLabel = $me['role_label'] ?? '';
-$isPQC       = !empty($me['can_admin'])
-            || in_array($userRole, ['admin', 'pqc', 'quality', 'quality manager'], true);
+$userDept      = $me['department'] ?? '';   // ← real DB column now
 
-// Department label to filter NCs (stored in audit_results.department)
 $DEPTS = ['Production', 'Material', 'Maintenance', 'Programming', 'Quality'];
 
-// Try to detect current user's department from their role_label
-$userDept = '';
-foreach ($DEPTS as $d) {
-    if (stripos($userRoleLabel, $d) !== false) { $userDept = $d; break; }
-}
-// If no dept matched but they're not PQC, default to showing all (they pick in filter)
+$isPQC = !empty($me['can_admin'])
+      || in_array($userRole, ['admin', 'pqc', 'quality', 'quality manager'], true)
+      || in_array(strtolower($userDept), ['pqc', 'quality', 'qa'], true);
 
 // ── Filters ──────────────────────────────────────────────────────────────────
 $fStatus  = $_GET['status'] ?? 'open';          // open | closed | all
@@ -79,14 +84,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!$nc) { $errors[] = 'NC not found.'; goto RENDER; }
 
         // Non-PQC: verify ownership via dept
+        // FIX: added ar.param = ? — previously matched only on stage, which
+        // let a department user "own" an NC that actually belonged to a
+        // different department's checkpoint on the same stage.
         if (!$isPQC && $fDept) {
-            // Check if the NG finding belongs to this dept (from audit_results)
             $deptCheck = $db->prepare(
                 "SELECT COUNT(*) FROM audit_results ar
                  JOIN audits a ON a.id = ar.audit_id
                  WHERE a.id = ? AND ar.result = 'NG'
-                   AND ar.stage = ? AND ar.department = ?");
-            $deptCheck->execute([$nc['audit_id'], $nc['stage'], $fDept]);
+                   AND ar.stage = ? AND ar.param = ? AND ar.department = ?");
+            $deptCheck->execute([$nc['audit_id'], $nc['stage'], $nc['defect_type'], $fDept]);
             if (!(int)$deptCheck->fetchColumn()) {
                 $errors[] = 'Access denied — this NC is not assigned to your department.';
                 goto RENDER;
@@ -201,6 +208,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 RENDER:
 
+// ── Count NCs pending QA verification (for badge on button) ──────────────────
+$pendingVerifyCount = 0;
+try {
+    $pendingVerifyCount = (int)$db->query("SELECT COUNT(*) FROM nonconformities WHERE status='in_review'")->fetchColumn();
+} catch (Throwable $e) {}
+
 // ── Build NC query ────────────────────────────────────────────────────────────
 $where = ['1=1'];
 $p     = [];
@@ -210,21 +223,32 @@ if ($fStatus === 'open')   { $where[] = "n.status IN ('open','in_review')"; }
 elseif ($fStatus === 'closed') { $where[] = "n.status = 'closed'"; }
 
 // Dept filter: join audit_results to get department
-// Non-PQC users only see their own dept's NGs
-if (!$isPQC && $userDept) {
+// Non-PQC users only see their own dept's NGs.
+// FIX: added ar2.param = n.defect_type — previously matched only on
+// (audit_id, stage), so ANY department's NG on the same stage satisfied
+// the EXISTS, leaking NCs from other departments' checkpoints whenever
+// they shared a stage with one of this user's real checkpoints.
+if (!$isPQC ) {
+  if ($userDept !='' && $userDept !== null){
     $where[] = "EXISTS (
         SELECT 1 FROM audit_results ar2
         WHERE ar2.audit_id = n.audit_id
           AND ar2.stage = n.stage
+          AND ar2.param = n.defect_type
           AND ar2.result = 'NG'
           AND ar2.department = ?
     )";
     $p[] = $userDept;
+  } else {
+    $where[] ='1=0';
+    $errors[] = 'your account has no department assigned.';
+  } 
 } elseif ($fDept !== '') {
     $where[] = "EXISTS (
         SELECT 1 FROM audit_results ar2
         WHERE ar2.audit_id = n.audit_id
           AND ar2.stage = n.stage
+          AND ar2.param = n.defect_type
           AND ar2.result = 'NG'
           AND ar2.department = ?
     )";
@@ -326,6 +350,11 @@ try {
 
 // ── KPI counts ────────────────────────────────────────────────────────────────
 // Always count across the full dept scope (not just current filter)
+// NOTE: this KPI-scope subquery still matches on stage only, NOT param —
+// left as-is here since it's a separate query from the two fixed above and
+// wasn't part of what was reported broken, but it has the SAME underlying
+// flaw (over-counts NCs from other departments sharing a stage). Flag for
+// a follow-up fix if KPI totals also look inflated for department users.
 $kpiWhere = $isPQC ? '1=1' : "EXISTS (
     SELECT 1 FROM audit_results ar3
     JOIN audits a3 ON a3.id = ar3.audit_id
@@ -718,7 +747,7 @@ include __DIR__ . '/includes/_head.php';
         <div style="display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin-top:8px">
           <!-- Dept: Edit RCA -->
           <?php if ($canEdit): ?>
-          <button type="button" class="rca-toggle <?= $ncStatus==='open'&&!$hasRCA?'':'':'' ?>"
+          <button type="button" class="rca-toggle <?= $ncStatus==='open'&&!'$hasRCA?'?>";
                   id="rca-toggle-<?= $ncId ?>"
                   onclick="toggleRCA(<?= $ncId ?>)">
             <i class="fa-solid <?= $hasRCA ? 'fa-pen-to-square' : 'fa-plus' ?>"></i>
@@ -774,7 +803,7 @@ include __DIR__ . '/includes/_head.php';
               <div class="rca-field" style="grid-column:1/-1">
                 <label><i class="fa-solid fa-search"></i> Root Cause *</label>
                 <textarea name="root_cause" class="form-ctrl" required
-                          placeholder="Why did this defect occur? (5-Why / Ishikawa…)"><?= e($nc['root_cause'] ?? '') ?></textarea>
+                          placeholder="Why did this defect occur? "><?= e($nc['root_cause'] ?? '') ?></textarea>
               </div>
               <!-- Corrective Action -->
               <div class="rca-field" style="grid-column:1/-1">
