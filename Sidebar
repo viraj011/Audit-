@@ -5,20 +5,7 @@ $ASSET  = $ASSET ?? '';
 $ACTIVE = $ACTIVE ?? 'dashboard';
 $me     = function_exists('currentUser') ? currentUser() : null;
 
-/* FIX: this used to check a single is_department_only_user() boolean,
- * which had a real bug — it exempted any department user whose ROLE
- * happened to have can_audit=1 set (a common, normal setup, since
- * can_audit is usually just "may use audit.php" on a role rather than
- * "is specifically a dedicated auditor"). A Maintenance/Production
- * account built on such a role saw the FULL sidebar exactly like an
- * unrestricted user. auth.php now resolves one of three tiers via
- * user_access_tier() — 'pqc', 'auditor', or 'department' — and that is
- * the single source of truth this file reads from, matching exactly
- * what requireLogin() enforces server-side. A link is only ever shown
- * here if the tier's page-level gate would actually let the click
- * through — never a dead-end link that immediately redirects away. */
 $tier = function_exists('user_access_tier') ? user_access_tier($me) : 'pqc';
-
 // [key, label, icon, href]
 $NAV = [
   ['dashboard',   'Dashboard',            'fa-gauge-high',          $ASSET.'dashboard.php'],
@@ -27,9 +14,13 @@ $NAV = [
   ['audits',      'Audit Records',        'fa-table-list',          $ASSET.'audits.php'],
   ['followup',    'Follow-up Audits',     'fa-rotate-right',        $ASSET.'followup.php'],
   ['auditor_history', 'Auditor History',  'fa-user-clock',          $ASSET.'auditor_history.php'],
-  // ['rca',         'RCA Module',           'fa-microscope',          $ASSET.'rca.php'],
+  //['nc_rca',      'NC Follow-up & RCA',   'fa-microscope',          $ASSET.'nc_rca.php'],
+  ['nc_verify',   'Verification Queue',   'fa-shield-halved',       $ASSET.'nc_verify.php'],
   ['analytics',   'Analytics',            'fa-chart-pie',           $ASSET.'analytics.php'],
+  ['ng_heatmap',  'NG Heatmap',           'fa-fire',                $ASSET.'ng_heatmap.php'],
   ['prediction',  'Prediction Dashboard', 'fa-brain',               $ASSET.'predictivedashboard.php'],
+  ['knowledge',   'Knowlegde Agent',      'fa-comments',            $ASSET.'agent/knowledge.php'],
+  ['agent',        'Qats Agent',          'fa-user-md',             $ASSET.'agent/run.php'],
 ];
 $ADMIN_NAV = [
   ['admin',       'Admin Home',           'fa-shield-halved', $ASSET.'admin/index.php'],
@@ -49,36 +40,21 @@ $QUICK = [
   ['Add Standard',     'fa-plus',            $ASSET.'admin/parameters.php'],
 ];
 
-if ($tier === 'department') {
-    // Tier 3: exactly one link, matching requireLogin()'s allowlist of
-    // exactly one page for this tier. No Quick Actions — every quick
-    // action links to a page this tier can't reach.
-    $NAV   = [['nc_rca', 'NC Follow-up', 'fa-clipboard-list', $ASSET.'nc_rca.php']];
-    $QUICK = [];
+if ($tier === 'department'){
+  $NAV =[['nc_rca','NC Follow-up & RCA','fa-clipboard-list',$ASSET.'nc_rca.php']];
+  $QUICK =[];
 } elseif ($tier === 'auditor') {
-    // Tier 2: audit entry, audit records, edit/delete, follow-up,
-    // auditor history, analytics, and dashboard — matching
-    // AUDITOR_ALLOWED_PAGES in auth.php exactly. Prediction Dashboard
-    // is intentionally dropped: it isn't on that allowlist, so leaving
-    // it visible here would show a link that immediately redirects
-    // away the moment it's clicked. Auto Audit shares audit.php's
-    // script name (only the query string differs) so it stays.
-    $NAV = array_values(array_filter($NAV, fn($n) => $n[0] !== 'prediction'));
-    // Auditors don't get the Admin section or admin-linked Quick
-    // Actions regardless of what can_admin says on their role — tier
-    // is now the deciding signal for nav visibility, not the raw flag.
-    $QUICK = array_values(array_filter($QUICK, fn($q) =>
-        !str_contains($q[2], 'admin/')
-    ));
+  $NAV= array_values(array_filter($NAV, fn($n)=> $n[0]!=='prediction'));
+  $QUICK = array_values(array_filter($QUICK, fn($q)=>
+      !str_contains($q[2],'admin/')));
 }
-// tier === 'pqc' → full $NAV, full $QUICK, Admin section shown below.
 
 $initials = $me ? strtoupper(substr($me['name'],0,1) . (strpos($me['name'],' ')!==false ? substr($me['name'], strpos($me['name'],' ')+1, 1) : '')) : 'QA';
 ?>
 <aside class="sidebar" id="sidebar">
   <div class="sidebar-brand">
-    <div class="brand-mark"></div>
-    <div class="brand-text"><strong>QATS</strong><small>SIEL Noida &middot; SMD Quality</small></div>
+    <div class="brand-mark"><i class="fa-solid fa-shield-halved"></i></div>
+    <div class="brand-text"><strong>QATS</strong><small>Quality Audit &amp;<br>Tracking System</small></div>
   </div>
 
   <nav class="sidebar-nav">
@@ -89,24 +65,32 @@ $initials = $me ? strtoupper(substr($me['name'],0,1) . (strpos($me['name'],' ')!
       </a>
     <?php endforeach; ?>
 
-    <?php if ($tier === 'pqc' && (!$me || !empty($me['can_admin']))): ?>
+    <?php if ($tier === 'pqc'): ?>
       <div class="nav-group-label">Administration</div>
       <?php foreach ($ADMIN_NAV as $n): ?>
         <a class="nav-item <?= $ACTIVE === $n[0] ? 'active' : '' ?>" href="<?= htmlspecialchars($n[3]) ?>">
           <i class="fa-solid <?= $n[2] ?>"></i> <?= htmlspecialchars($n[1]) ?>
         </a>
       <?php endforeach; ?>
+
+      <div class="nav-group-label">Quality Insights</div>
+      <a class="nav-item <?= $ACTIVE === 'repeat_defects' ? 'active' : '' ?>" href="<?= $ASSET.'repeat_defects.php' ?>">
+        <i class="fa-solid fa-arrows-rotate"></i> Repeat Defects
+      </a>
+      <a class="nav-item <?= $ACTIVE === 'auditor_scorecard' ? 'active' : '' ?>" href="<?= $ASSET.'auditor_scorecard.php' ?>">
+        <i class="fa-solid fa-user-check"></i> Auditor Scorecard
+      </a>
     <?php endif; ?>
   </nav>
 
-  <?php if (!empty($QUICK)): ?>
+  <?php if (!empty($QUICK)):?>
   <div class="quick-actions">
     <div class="quick-head"><span>Quick Actions</span><span class="quick-live"><span class="live-dot"></span>Live</span></div>
     <?php foreach ($QUICK as $q): ?>
       <a class="quick-btn" href="<?= htmlspecialchars($q[2]) ?>"><i class="fa-solid <?= $q[1] ?>"></i> <?= htmlspecialchars($q[0]) ?></a>
     <?php endforeach; ?>
   </div>
-  <?php endif; ?>
+  <?php endif; ?> 
 
   <div class="sidebar-user">
     <div class="avatar"><?= htmlspecialchars($initials) ?></div>
