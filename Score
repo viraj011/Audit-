@@ -1,0 +1,325 @@
+<?php
+/* ============================================================================
+ *  auditor_scorecard.php — Auditor Consistency Scoring
+ *  ---------------------------------------------------------------------------
+ *  Two questions this answers:
+ *
+ *  1. VOLUME & ACTIVITY — how many audits has each auditor done, what's
+ *     their overall NG rate, and are any of them going quiet (haven't
+ *     audited in a while, or barely auditing at all lately)?
+ *
+ *  2. CALIBRATION — on the EXACT SAME (line, model, stage) combination,
+ *     does one auditor consistently flag a very different NG rate than
+ *     their peers auditing the identical thing? That's either a real
+ *     difference in what's being produced on different days, or a
+ *     standards-calibration gap between auditors — this page can't tell
+ *     you which, but it tells you WHERE to look, which nothing else in
+ *     this app currently does.
+ *
+ *  ASSUMPTION (stated, not guessed silently): this treats audits.operator
+ *  as the auditor identity field — matching how it's already used in
+ *  ml/predict.py's risk_matrix(). If auditor_history.php actually keys
+ *  on a different column, this needs adjusting to match.
+ *
+ *  All numbers here are plain SQL aggregation of real audit_results /
+ *  audits rows — nothing here is a model or a prediction, and the
+ *  deviation thresholds below are tunable starting defaults, not a
+ *  claimed statistical standard.
+ * ==========================================================================*/
+
+require_once __DIR__ . '/includes/auth.php';
+require_once __DIR__ . '/includes/helpers.php';
+require_once __DIR__ . '/includes/components.php';
+requireLogin();
+
+$db = db();
+$me = currentUser();
+
+// PQC-only — this compares auditors against each other, which is a
+// QA-management view, not something an individual auditor needs to see
+// about their peers.
+$userRole = strtolower($me['role'] ?? '');
+$userDept = $me['department'] ?? '';
+$isPQC = !empty($me['can_admin'])
+      || in_array($userRole, ['admin', 'pqc', 'quality', 'quality manager'], true)
+      || in_array(strtolower($userDept), ['pqc', 'quality', 'qa'], true);
+
+if (!$isPQC) {
+    header('Location: ' . (function_exists('base_path') ? base_path() : '') . 'dashboard.php');
+    exit;
+}
+
+// ── Tunable thresholds (defaults — adjust to your actual audit cadence) ─────
+$INACTIVE_DAYS          = 14;  // no audits at all in this many days → flagged inactive
+$LOW_VOLUME_WINDOW_DAYS = 30;  // window used to measure "recent" volume
+$LOW_VOLUME_THRESHOLD   = 3;   // fewer than this many audits in that window → flagged low-volume
+$MIN_CHECKS_FOR_CALIB   = 15;  // an auditor needs at least this many checks on a
+                               // specific (line,model,stage) before their rate on
+                               // it is trusted enough to compare — small samples
+                               // produce noisy percentages that look like outliers
+                               // but aren't.
+$DEVIATION_FLAG_PTS     = 10;  // flag if an auditor's NG rate on a combo differs
+                               // from their peers' combined rate by more than this
+                               // many percentage points.
+
+// ── 1. Per-auditor volume & activity ────────────────────────────────────────
+$auditorRows = [];
+try {
+    $auditorRows = $db->query("
+        SELECT
+            a.operator,
+            COUNT(*)                AS total_audits,
+            SUM(a.total_checks)     AS total_checks,
+            SUM(a.ng_count)         AS total_ng,
+            MAX(a.created_at)       AS last_audit,
+            SUM(a.created_at >= DATE_SUB(NOW(), INTERVAL $LOW_VOLUME_WINDOW_DAYS DAY)) AS recent_audits
+        FROM audits a
+        WHERE a.operator IS NOT NULL AND a.operator <> ''
+        GROUP BY a.operator
+        ORDER BY total_audits DESC
+    ")->fetchAll();
+} catch (Throwable $e) {
+    $auditorRows = [];
+}
+
+$scorecard = [];
+foreach ($auditorRows as $r) {
+    $checks   = (int)$r['total_checks'];
+    $ng       = (int)$r['total_ng'];
+    $ngRate   = $checks > 0 ? round($ng / $checks * 100, 1) : 0.0;
+    $lastDate = $r['last_audit'] ? new DateTime($r['last_audit']) : null;
+    $daysSince = $lastDate ? (new DateTime())->diff($lastDate)->days : null;
+
+    $flags = [];
+    if ($daysSince === null || $daysSince >= $INACTIVE_DAYS) {
+        $flags[] = ['label' => 'Inactive', 'cls' => 'badge-red'];
+    } elseif ((int)$r['recent_audits'] < $LOW_VOLUME_THRESHOLD) {
+        $flags[] = ['label' => 'Low Volume', 'cls' => 'badge-amber'];
+    }
+
+    $scorecard[] = [
+        'operator'       => $r['operator'],
+        'total_audits'   => (int)$r['total_audits'],
+        'total_checks'   => $checks,
+        'total_ng'       => $ng,
+        'ng_rate'        => $ngRate,
+        'last_audit'     => $r['last_audit'],
+        'days_since'     => $daysSince,
+        'recent_audits'  => (int)$r['recent_audits'],
+        'flags'          => $flags,
+    ];
+}
+
+// ── 2. Calibration — same (line, model, stage), different auditors ─────────
+$comboRows = [];
+try {
+    $comboRows = $db->query("
+        SELECT a.line, a.model, ar.stage, a.operator,
+               COUNT(*)                    AS checks,
+               SUM(ar.result = 'NG')       AS ng
+        FROM audit_results ar
+        JOIN audits a ON a.id = ar.audit_id
+        WHERE a.operator IS NOT NULL AND a.operator <> ''
+          AND a.line  IS NOT NULL AND a.line  <> ''
+          AND a.model IS NOT NULL AND a.model <> ''
+          AND ar.stage IS NOT NULL AND ar.stage <> ''
+        GROUP BY a.line, a.model, ar.stage, a.operator
+        HAVING checks >= $MIN_CHECKS_FOR_CALIB
+    ")->fetchAll();
+} catch (Throwable $e) {
+    $comboRows = [];
+}
+
+// Group by (line, model, stage) so we can compare each auditor against
+// the OTHER auditors on that exact same combination.
+$byCombo = [];
+foreach ($comboRows as $r) {
+    $key = $r['line'] . '|' . $r['model'] . '|' . $r['stage'];
+    $byCombo[$key]['line']  = $r['line'];
+    $byCombo[$key]['model'] = $r['model'];
+    $byCombo[$key]['stage'] = $r['stage'];
+    $byCombo[$key]['rows'][] = $r;
+}
+
+$outliers = [];
+foreach ($byCombo as $combo) {
+    $rows = $combo['rows'];
+    if (count($rows) < 2) continue;   // need at least 2 auditors to compare
+
+    $totalChecks = array_sum(array_column($rows, 'checks'));
+    $totalNg     = array_sum(array_column($rows, 'ng'));
+
+    foreach ($rows as $r) {
+        $ownChecks = (int)$r['checks'];
+        $ownNg     = (int)$r['ng'];
+        $ownRate   = round($ownNg / $ownChecks * 100, 1);
+
+        // "Others" = the combo total minus this auditor's own contribution —
+        // comparing against peers, not against a mean that includes yourself.
+        $othersChecks = $totalChecks - $ownChecks;
+        $othersNg     = $totalNg - $ownNg;
+        if ($othersChecks <= 0) continue;   // no actual peer to compare against
+        $othersRate = round($othersNg / $othersChecks * 100, 1);
+
+        $deviation = round($ownRate - $othersRate, 1);
+        if (abs($deviation) >= $DEVIATION_FLAG_PTS) {
+            $outliers[] = [
+                'line'         => $combo['line'],
+                'model'        => $combo['model'],
+                'stage'        => $combo['stage'],
+                'operator'     => $r['operator'],
+                'checks'       => $ownChecks,
+                'own_rate'     => $ownRate,
+                'peer_rate'    => $othersRate,
+                'deviation'    => $deviation,
+                'direction'    => $deviation > 0 ? 'higher' : 'lower',
+            ];
+        }
+    }
+}
+usort($outliers, fn($a, $b) => abs($b['deviation']) <=> abs($a['deviation']));
+
+// ── KPIs ─────────────────────────────────────────────────────────────────────
+$totalAuditors    = count($scorecard);
+$inactiveCount    = count(array_filter($scorecard, fn($s) => in_array('Inactive', array_column($s['flags'], 'label'))));
+$lowVolumeCount   = count(array_filter($scorecard, fn($s) => in_array('Low Volume', array_column($s['flags'], 'label'))));
+$outlierCount     = count($outliers);
+
+$PAGE_TITLE   = 'Auditor Scorecard';
+$PAGE_HEADING = 'Auditor Consistency Scoring';
+$PAGE_SUB     = 'Volume, activity, and cross-auditor calibration on identical audit combinations';
+$ACTIVE       = 'auditor_scorecard';
+$ASSET        = '';
+include __DIR__ . '/includes/_head.php';
+?>
+<div class="app">
+<?php include __DIR__ . '/includes/_sidebar.php'; ?>
+<div class="content">
+<?php include __DIR__ . '/includes/_topbar.php'; ?>
+<main class="page">
+<?php render_flashes(); ?>
+
+<style>
+.asc-kpi-strip{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.asc-kpi{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:13px 15px;text-align:center}
+.asc-kpi-label{font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
+.asc-kpi-val{font-size:26px;font-weight:800;line-height:1}
+.asc-note{font-size:10.5px;color:var(--muted);margin:-8px 0 18px}
+@media(max-width:760px){.asc-kpi-strip{grid-template-columns:1fr 1fr}}
+</style>
+
+<div class="asc-kpi-strip">
+  <div class="asc-kpi">
+    <div class="asc-kpi-label">Active Auditors</div>
+    <div class="asc-kpi-val"><?= $totalAuditors ?></div>
+  </div>
+  <div class="asc-kpi">
+    <div class="asc-kpi-label">Inactive (&gt;<?= $INACTIVE_DAYS ?>d)</div>
+    <div class="asc-kpi-val" style="color:var(--red)"><?= $inactiveCount ?></div>
+  </div>
+  <div class="asc-kpi">
+    <div class="asc-kpi-label">Low Volume</div>
+    <div class="asc-kpi-val" style="color:var(--amber)"><?= $lowVolumeCount ?></div>
+  </div>
+  <div class="asc-kpi">
+    <div class="asc-kpi-label">Calibration Outliers</div>
+    <div class="asc-kpi-val" style="color:var(--amber)"><?= $outlierCount ?></div>
+  </div>
+</div>
+
+<section class="panel" style="margin-bottom:24px">
+  <div class="panel-head">
+    <div class="panel-title">Auditor Volume &amp; Activity</div>
+    <span class="panel-sub"><?= $totalAuditors ?> auditors</span>
+  </div>
+  <div class="panel-body flush">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Auditor</th>
+          <th>Total Audits</th>
+          <th>Total Checks</th>
+          <th>NG Rate</th>
+          <th>Last Audit</th>
+          <th>Last <?= $LOW_VOLUME_WINDOW_DAYS ?>d</th>
+          <th>Flags</th>
+        </tr>
+      </thead>
+      <tbody>
+        <?php if ($scorecard): foreach ($scorecard as $s): ?>
+        <tr>
+          <td><?= e($s['operator']) ?></td>
+          <td><?= $s['total_audits'] ?></td>
+          <td><?= $s['total_checks'] ?></td>
+          <td><?= $s['ng_rate'] ?>%</td>
+          <td><?= $s['last_audit'] ? e(substr($s['last_audit'], 0, 16)) : '—' ?>
+              <?php if ($s['days_since'] !== null): ?>
+              <span style="color:var(--muted);font-size:9.5px"> (<?= $s['days_since'] ?>d ago)</span>
+              <?php endif; ?>
+          </td>
+          <td><?= $s['recent_audits'] ?></td>
+          <td>
+            <?php foreach ($s['flags'] as $f): ?>
+              <span class="badge-pill <?= $f['cls'] ?>" style="font-size:9px"><?= e($f['label']) ?></span>
+            <?php endforeach; ?>
+          </td>
+        </tr>
+        <?php endforeach; else: ?>
+        <tr><td colspan="7" class="text-muted" style="padding:18px">No audit data yet.</td></tr>
+        <?php endif; ?>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <div class="panel-title">Calibration Outliers</div>
+    <span class="panel-sub"><?= $outlierCount ?> flagged</span>
+  </div>
+  <div class="asc-note" style="padding:0 16px">
+    Compares each auditor's NG rate against OTHER auditors' combined rate on the exact same line + model + stage —
+    only shown where both sides have at least <?= $MIN_CHECKS_FOR_CALIB ?> checks, so small samples don't produce noise.
+    A flag here means "worth a conversation," not "this auditor is wrong" — it could equally mean real production
+    variation between shifts.
+  </div>
+  <div class="panel-body flush">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Line</th>
+          <th>Model</th>
+          <th>Stage</th>
+          <th>Auditor</th>
+          <th>Checks</th>
+          <th>Their NG Rate</th>
+          <th>Peers' NG Rate</th>
+          <th>Deviation</th>
+        </tr>
+      </thead>
+      <tbody>
+        <?php if ($outliers): foreach ($outliers as $o):
+              $devCls = abs($o['deviation']) >= $DEVIATION_FLAG_PTS * 2 ? 'badge-red' : 'badge-amber';
+        ?>
+        <tr>
+          <td><?= e($o['line']) ?></td>
+          <td><?= e($o['model']) ?></td>
+          <td><?= e($o['stage']) ?></td>
+          <td><?= e($o['operator']) ?></td>
+          <td><?= $o['checks'] ?></td>
+          <td><?= $o['own_rate'] ?>%</td>
+          <td><?= $o['peer_rate'] ?>%</td>
+          <td><span class="badge-pill <?= $devCls ?>"><?= $o['deviation'] > 0 ? '+' : '' ?><?= $o['deviation'] ?>pts (<?= $o['direction'] ?>)</span></td>
+        </tr>
+        <?php endforeach; else: ?>
+        <tr><td colspan="8" class="text-muted" style="padding:18px">No calibration outliers found at current thresholds.</td></tr>
+        <?php endif; ?>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</main>
+</div>
+</div>
+<?php $ASSET = ''; include __DIR__ . '/includes/_foot.php'; ?>
