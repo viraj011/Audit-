@@ -1,0 +1,113 @@
+<?php
+/**
+ * Dew point via the Magnus formula. Used as a cross-check on RH:
+ * RH can rise just because temperature fell, with no moisture added.
+ * Dew point tracks actual moisture content and barely moves with temperature.
+ */
+function dew_point(float $tempC, float $rh): float
+{
+    $a = 17.62;
+    $b = 243.12;
+    $rh = max($rh, 0.1); // guard against log(0)
+    $gamma = ($a * $tempC) / ($b + $tempC) + log($rh / 100.0);
+    return round(($b * $gamma) / ($a - $gamma), 2);
+}
+
+/**
+ * Fetch the threshold row for a printer, falling back to the
+ * 'DEFAULT' row if no printer-specific limits have been set.
+ */
+function get_thresholds(PDO $pdo, string $printer_id): ?array
+{
+    $stmt = $pdo->prepare("SELECT * FROM thresholds WHERE printer_id = ?");
+    $stmt->execute([$printer_id]);
+    $row = $stmt->fetch();
+    if (!$row) {
+        $stmt = $pdo->prepare("SELECT * FROM thresholds WHERE printer_id = 'DEFAULT'");
+        $stmt->execute();
+        $row = $stmt->fetch();
+    }
+    return $row ?: null;
+}
+
+/**
+ * Dwell-based alarm evaluation.
+ *
+ * Why dwell matters: a single noisy reading crossing a limit is not
+ * a real excursion. This walks backward through recent readings and
+ * only opens/keeps an alarm once the condition has held continuously
+ * for at least `dwell_seconds`. When the condition clears, any active
+ * alarm of that type is closed immediately (no dwell needed to clear).
+ *
+ * One alarm ROW per continuous episode, not one row per reading.
+ */
+function evaluate_alarms(PDO $pdo, string $printer_id, string $ts): void
+{
+    $thresholds = get_thresholds($pdo, $printer_id);
+    if (!$thresholds) {
+        return; // no limits configured — nothing to evaluate against
+    }
+
+    $dwell = (int) $thresholds['dwell_seconds'];
+
+    $checks = [
+        'temp_high' => fn($r) => (float)$r['temperature'] > (float)$thresholds['temp_max'],
+        'temp_low'  => fn($r) => (float)$r['temperature'] < (float)$thresholds['temp_min'],
+        'rh_high'   => fn($r) => (float)$r['humidity']    > (float)$thresholds['rh_max'],
+        'rh_low'    => fn($r) => (float)$r['humidity']    < (float)$thresholds['rh_min'],
+    ];
+
+    // Most recent readings first — enough history to cover a few dwell periods.
+    $stmt = $pdo->prepare(
+        "SELECT ts, temperature, humidity FROM readings
+         WHERE printer_id = ? ORDER BY ts DESC LIMIT 200"
+    );
+    $stmt->execute([$printer_id]);
+    $recent = $stmt->fetchAll();
+
+    foreach ($checks as $type => $violates) {
+        $violation_start = null;
+        $peak = null;
+        $is_high = str_contains($type, 'high');
+
+        foreach ($recent as $r) {
+            if ($violates($r)) {
+                $violation_start = $r['ts']; // keep walking back
+                $val = str_starts_with($type, 'temp') ? (float)$r['temperature'] : (float)$r['humidity'];
+                $peak = ($peak === null) ? $val : ($is_high ? max($peak, $val) : min($peak, $val));
+            } else {
+                break; // continuity broken — stop walking back
+            }
+        }
+
+        $stmt2 = $pdo->prepare(
+            "SELECT * FROM alarms WHERE printer_id = ? AND alarm_type = ? AND status = 'active'"
+        );
+        $stmt2->execute([$printer_id, $type]);
+        $active = $stmt2->fetch();
+
+        if ($violation_start !== null) {
+            $duration = strtotime($ts) - strtotime($violation_start);
+            if ($duration >= $dwell) {
+                if ($active) {
+                    $new_peak = $is_high
+                        ? max((float)$active['peak_value'], $peak)
+                        : min((float)$active['peak_value'], $peak);
+                    $upd = $pdo->prepare("UPDATE alarms SET peak_value = ? WHERE id = ?");
+                    $upd->execute([$new_peak, $active['id']]);
+                } else {
+                    $ins = $pdo->prepare(
+                        "INSERT INTO alarms (printer_id, alarm_type, start_ts, peak_value, status)
+                         VALUES (?, ?, ?, ?, 'active')"
+                    );
+                    $ins->execute([$printer_id, $type, $violation_start, $peak]);
+                }
+            }
+            // else: violating, but not yet past dwell — treated as noise, not logged
+        } elseif ($active) {
+            // condition has cleared — close the episode
+            $upd = $pdo->prepare("UPDATE alarms SET end_ts = ?, status = 'cleared' WHERE id = ?");
+            $upd->execute([$ts, $active['id']]);
+        }
+    }
+}
