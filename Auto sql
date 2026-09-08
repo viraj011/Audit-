@@ -1,0 +1,50 @@
+-- Environmental monitoring schema for SMD print area
+-- Run once: mysql -u root -p < schema.sql
+
+CREATE DATABASE IF NOT EXISTS envmonitor CHARACTER SET utf8mb4;
+USE envmonitor;
+
+-- Every reading received, one row per sample.
+-- `source` distinguishes real sensor data from synthetic/demo data,
+-- so synthetic data can never be mistaken for a real measurement.
+CREATE TABLE IF NOT EXISTS readings (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    printer_id    VARCHAR(50)  NOT NULL DEFAULT 'SMD-01',
+    ts            DATETIME     NOT NULL,
+    temperature   DECIMAL(5,2) NOT NULL,   -- degrees C
+    humidity      DECIMAL(5,2) NOT NULL,   -- % RH
+    dew_point     DECIMAL(5,2) NOT NULL,   -- degrees C, computed on ingest
+    source        VARCHAR(20)  NOT NULL DEFAULT 'sensor', -- 'sensor' or 'simulated'
+    INDEX idx_printer_ts (printer_id, ts)
+) ENGINE=InnoDB;
+
+-- One row of acceptable limits per printer (or a 'DEFAULT' fallback row).
+-- dwell_seconds: how long a condition must persist before it is
+-- treated as a real excursion rather than sensor noise.
+CREATE TABLE IF NOT EXISTS thresholds (
+    printer_id     VARCHAR(50) PRIMARY KEY,
+    temp_min       DECIMAL(5,2) NOT NULL DEFAULT 23.0,
+    temp_max       DECIMAL(5,2) NOT NULL DEFAULT 27.0,
+    rh_min         DECIMAL(5,2) NOT NULL DEFAULT 40.0,
+    rh_max         DECIMAL(5,2) NOT NULL DEFAULT 70.0,
+    dwell_seconds  INT NOT NULL DEFAULT 300
+) ENGINE=InnoDB;
+
+-- One row per excursion episode (not per reading). Opens when a
+-- condition has persisted >= dwell_seconds, closes when it clears.
+CREATE TABLE IF NOT EXISTS alarms (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    printer_id   VARCHAR(50) NOT NULL,
+    alarm_type   ENUM('temp_high','temp_low','rh_high','rh_low') NOT NULL,
+    start_ts     DATETIME NOT NULL,
+    end_ts       DATETIME NULL,
+    peak_value   DECIMAL(5,2) NOT NULL,
+    status       ENUM('active','cleared') NOT NULL DEFAULT 'active',
+    INDEX idx_printer_status (printer_id, status)
+) ENGINE=InnoDB;
+
+-- Default fallback limits, used if a printer has no specific row.
+-- Replace 23/27/40/70 with the real paste-datasheet limits once known.
+INSERT INTO thresholds (printer_id, temp_min, temp_max, rh_min, rh_max, dwell_seconds)
+VALUES ('DEFAULT', 23.0, 27.0, 40.0, 70.0, 300)
+ON DUPLICATE KEY UPDATE printer_id = printer_id;
