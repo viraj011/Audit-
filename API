@@ -1,0 +1,74 @@
+<?php
+/**
+ * GET endpoint consumed by the dashboard. Returns everything the
+ * dashboard needs in one call: latest reading, threshold limits,
+ * recent history for the chart, active/recent alarms, and a
+ * time-outside-limits percentage over the requested window.
+ *
+ * Query params:
+ *   printer_id (default 'SMD-01')
+ *   hours      (default 24) - history window
+ */
+require __DIR__ . '/config.php';
+
+header('Content-Type: application/json');
+
+$printer_id = $_GET['printer_id'] ?? 'SMD-01';
+$hours = isset($_GET['hours']) ? max(1, min(720, (int)$_GET['hours'])) : 24;
+
+$t_stmt = $pdo->prepare("SELECT * FROM thresholds WHERE printer_id = ?");
+$t_stmt->execute([$printer_id]);
+$thresholds = $t_stmt->fetch();
+if (!$thresholds) {
+    $t_stmt = $pdo->prepare("SELECT * FROM thresholds WHERE printer_id = 'DEFAULT'");
+    $t_stmt->execute();
+    $thresholds = $t_stmt->fetch();
+}
+
+$latest_stmt = $pdo->prepare(
+    "SELECT * FROM readings WHERE printer_id = ? ORDER BY ts DESC LIMIT 1"
+);
+$latest_stmt->execute([$printer_id]);
+$latest = $latest_stmt->fetch();
+
+$hist_stmt = $pdo->prepare(
+    "SELECT ts, temperature, humidity, dew_point FROM readings
+     WHERE printer_id = ? AND ts >= (NOW() - INTERVAL ? HOUR)
+     ORDER BY ts ASC"
+);
+$hist_stmt->execute([$printer_id, $hours]);
+$history = $hist_stmt->fetchAll();
+
+$alarms_stmt = $pdo->prepare(
+    "SELECT * FROM alarms WHERE printer_id = ? ORDER BY start_ts DESC LIMIT 50"
+);
+$alarms_stmt->execute([$printer_id]);
+$alarms = $alarms_stmt->fetchAll();
+
+$total = count($history);
+$outside = 0;
+if ($thresholds) {
+    foreach ($history as $r) {
+        if ((float)$r['temperature'] > (float)$thresholds['temp_max']
+            || (float)$r['temperature'] < (float)$thresholds['temp_min']
+            || (float)$r['humidity'] > (float)$thresholds['rh_max']
+            || (float)$r['humidity'] < (float)$thresholds['rh_min']) {
+            $outside++;
+        }
+    }
+}
+$pct_outside = $total > 0 ? round(100 * $outside / $total, 1) : null;
+
+$printers_stmt = $pdo->query("SELECT DISTINCT printer_id FROM readings ORDER BY printer_id");
+$printers = array_column($printers_stmt->fetchAll(), 'printer_id');
+
+echo json_encode([
+    'printer_id' => $printer_id,
+    'printers' => $printers,
+    'thresholds' => $thresholds,
+    'latest' => $latest,
+    'history' => $history,
+    'alarms' => $alarms,
+    'pct_time_outside_limits' => $pct_outside,
+    'history_count' => $total,
+]);
