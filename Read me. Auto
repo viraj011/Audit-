@@ -1,0 +1,109 @@
+# Print Area Environmental Monitor
+
+PHP + MySQL + vanilla JS. No CDNs, no external services, no internet
+dependency of any kind — everything runs on your XAMPP stack.
+
+## What this actually does
+
+- `ingest.php` — POST endpoint. Takes one temperature/humidity reading,
+  computes dew point, logs it.
+- `functions.php` — dew point (Magnus formula) and the alarm logic.
+- `api_data.php` — GET endpoint the dashboard polls for current values,
+  history, thresholds, and alarms.
+- `index.html` — dashboard. Plain HTML/CSS/JS, canvas-drawn charts
+  (no chart library), polls `api_data.php` every 5 seconds.
+- `simulate.php` — generates **synthetic** demo readings so you can see
+  the system work before you have a real sensor or DMC-201 feed. Every
+  row it writes is tagged `source='simulated'` in the database and
+  shown as "SIMULATED DATA" on the dashboard — it can never be confused
+  with a real reading.
+
+## Alarm logic — how it actually behaves (tested)
+
+An alarm is **not** raised the instant a reading crosses a limit. It
+walks back through recent readings and only opens once the condition
+has held continuously for `dwell_seconds` (default 300s = 5 min). This
+matters because a single noisy reading crossing 27.01°C is not a real
+excursion, and treating it as one would flood you with alarms.
+
+I ran three scenarios against a live instance before shipping this:
+
+1. **Sustained excursion** — temperature held above the limit for
+   10 minutes → one alarm row opened, `start_ts` correctly backdated to
+   when the excursion actually began (not when the dwell period ended),
+   `peak_value` tracked the worst reading.
+2. **Recovery** — feeding in-range readings afterward → the alarm row
+   closed with the correct `end_ts`, status changed to `cleared`.
+3. **Brief blip** — two out-of-range readings 30s apart, well under the
+   5-minute dwell → **no alarm row created at all.** This is deliberate.
+
+One alarm = one continuous episode, not one row per bad reading.
+
+## Setup
+
+```bash
+mysql -u root -p < schema.sql
+```
+
+This creates the `envmonitor` database and a `DEFAULT` threshold row
+(23–27°C, 40–70% RH — **replace with the real paste-datasheet limits**,
+this is a placeholder). Then create a DB user and either set these as
+environment variables or edit `config.php` directly:
+
+```
+ENVMON_DB_HOST=localhost
+ENVMON_DB_NAME=envmonitor
+ENVMON_DB_USER=envmonitor
+ENVMON_DB_PASS=<your password>
+```
+
+Drop the whole folder into your XAMPP `htdocs`, e.g.
+`C:\xampp\htdocs\envmonitor\`, and open
+`http://localhost/envmonitor/index.html`.
+
+## Try it with synthetic data first
+
+```bash
+php simulate.php              # gentle random walk around setpoint
+php simulate.php --excursion  # deliberately drifts high after ~20s,
+                               # so you can watch an alarm actually fire
+```
+
+Watch `index.html` while this runs. **Delete these rows before treating
+anything as real data** — `DELETE FROM readings WHERE source='simulated';`
+
+## Feeding real data in
+
+Once you have either a sensor or read access to whatever the DMC-201
+logs to, POST to `ingest.php`:
+
+```bash
+curl -X POST http://localhost/envmonitor/ingest.php \
+  -H "Content-Type: application/json" \
+  -d '{"printer_id":"SMD-01","temperature":25.1,"humidity":45.2}'
+```
+
+If you get a bulk CSV export instead of a live feed, write a one-off
+PHP or Python script that reads the CSV and POSTs each row with its
+original timestamp via the `ts` field — that backfills history and lets
+the same alarm logic run against it retroactively.
+
+## What I have NOT done, and why
+
+- **No real limits.** 23–27°C / 40–70% RH in `schema.sql` is a
+  placeholder carried over from the original brief. Update the
+  `thresholds` table once you have the actual paste datasheet numbers —
+  this is a one-row UPDATE, not a code change.
+- **No source-vs-target comparison.** This logs one reading per
+  printer. If you get access to both a supply-side and enclosure-side
+  reading, the schema's `printer_id` field can be reused as a second
+  "probe" identity, but the gating logic discussed earlier (only alarm
+  on rising humidity if source dew point is actually lower) isn't
+  implemented here — it needs two live channels to mean anything, and
+  you don't have that yet.
+- **No authentication.** Assumed internal network only. Add HTTP basic
+  auth or a login if this needs to be reachable outside the plant LAN.
+- **No email/SMS alerting**, only in-dashboard display. Wiring alarms
+  to an email would be a small addition to `evaluate_alarms()` once
+  you have an SMTP relay to use — genuinely easy to add, didn't want to
+  guess your mail setup.
