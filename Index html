@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Print Area Environmental Monitor</title>
+<style>
+  :root {
+    --ok: #2e7d32;
+    --warn: #e65100;
+    --bad: #c62828;
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --ink: #1a1a1a;
+    --muted: #6b7280;
+    --border: #e2e4e8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  header {
+    padding: 16px 24px;
+    background: #1428A0;
+    color: white;
+  }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .sub { font-size: 12px; opacity: 0.8; margin-top: 2px; }
+  main {
+    padding: 20px;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+  .controls {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 16px;
+    font-size: 13px;
+  }
+  select, .refresh-note { font-size: 13px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card .label {
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .card .value {
+    font-size: 32px;
+    font-weight: 600;
+    margin-top: 6px;
+  }
+  .card .range {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .status-ok { color: var(--ok); }
+  .status-warn { color: var(--warn); }
+  .status-bad { color: var(--bad); }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-top: 6px;
+  }
+  .badge.ok { background: #e8f5e9; color: var(--ok); }
+  .badge.bad { background: #ffebee; color: var(--bad); }
+  .badge.sim { background: #fff3e0; color: var(--warn); }
+  section h2 {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 24px 0 10px;
+  }
+  canvas {
+    width: 100%;
+    height: 240px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    font-size: 13px;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  tr:last-child td { border-bottom: none; }
+  .empty {
+    padding: 20px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .status-line {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Print Area Environmental Monitor</h1>
+  <div class="sub" id="last-update">Loading…</div>
+</header>
+
+<main>
+  <div class="controls">
+    <label for="printer-select">Printer:</label>
+    <select id="printer-select"><option value="SMD-01">SMD-01</option></select>
+    <label for="hours-select">Window:</label>
+    <select id="hours-select">
+      <option value="1">Last 1 hour</option>
+      <option value="6">Last 6 hours</option>
+      <option value="24" selected>Last 24 hours</option>
+      <option value="168">Last 7 days</option>
+    </select>
+    <span class="refresh-note">Auto-refreshes every 5s</span>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Temperature</div>
+      <div class="value" id="temp-value">—</div>
+      <div class="range" id="temp-range">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Humidity</div>
+      <div class="value" id="rh-value">—</div>
+      <div class="range" id="rh-range">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Dew Point</div>
+      <div class="value" id="dp-value">—</div>
+      <div class="range">Condensation risk indicator</div>
+    </div>
+    <div class="card">
+      <div class="label">Time Outside Limits</div>
+      <div class="value" id="pct-value">—</div>
+      <div class="range" id="pct-range">over selected window</div>
+    </div>
+  </div>
+
+  <section>
+    <h2>Temperature Trend (°C)</h2>
+    <canvas id="temp-chart"></canvas>
+  </section>
+
+  <section>
+    <h2>Humidity Trend (% RH)</h2>
+    <canvas id="rh-chart"></canvas>
+  </section>
+
+  <section>
+    <h2>Alarms</h2>
+    <div id="alarms-container"><div class="empty">Loading…</div></div>
+  </section>
+</main>
+
+<script>
+const printerSelect = document.getElementById('printer-select');
+const hoursSelect = document.getElementById('hours-select');
+
+function fmt(v, decimals = 1) {
+  return (v === null || v === undefined) ? '—' : Number(v).toFixed(decimals);
+}
+
+function statusClass(value, min, max) {
+  if (value === null || value === undefined) return '';
+  if (value < min || value > max) return 'status-bad';
+  const margin = (max - min) * 0.1;
+  if (value < min + margin || value > max - margin) return 'status-warn';
+  return 'status-ok';
+}
+
+function drawChart(canvas, series, min, max, unit) {
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (series.length === 0) {
+    ctx.fillStyle = '#6b7280';
+    ctx.font = '13px sans-serif';
+    ctx.fillText('No data yet', 16, H / 2);
+    return;
+  }
+
+  const padding = { top: 16, right: 16, bottom: 22, left: 40 };
+  const plotW = W - padding.left - padding.right;
+  const plotH = H - padding.top - padding.bottom;
+
+  const values = series.map(p => p.v);
+  let vMin = Math.min(...values, min);
+  let vMax = Math.max(...values, max);
+  const pad = (vMax - vMin) * 0.1 || 1;
+  vMin -= pad; vMax += pad;
+
+  const x = i => padding.left + (i / Math.max(series.length - 1, 1)) * plotW;
+  const y = v => padding.top + plotH - ((v - vMin) / (vMax - vMin)) * plotH;
+
+  // limit band
+  ctx.fillStyle = 'rgba(46,125,50,0.06)';
+  ctx.fillRect(padding.left, y(max), plotW, y(min) - y(max));
+
+  // limit lines
+  ctx.strokeStyle = '#c62828';
+  ctx.setLineDash([4, 4]);
+  ctx.lineWidth = 1;
+  [min, max].forEach(limit => {
+    ctx.beginPath();
+    ctx.moveTo(padding.left, y(limit));
+    ctx.lineTo(padding.left + plotW, y(limit));
+    ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
+  // series line
+  ctx.strokeStyle = '#1428A0';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  series.forEach((p, i) => {
+    const px = x(i), py = y(p.v);
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  });
+  ctx.stroke();
+
+  // axis labels
+  ctx.fillStyle = '#6b7280';
+  ctx.font = '11px sans-serif';
+  ctx.fillText(vMax.toFixed(1) + unit, 2, y(vMax) + 4);
+  ctx.fillText(vMin.toFixed(1) + unit, 2, y(vMin) + 4);
+  if (series.length > 1) {
+    ctx.fillText(series[0].t, padding.left, H - 6);
+    ctx.textAlign = 'right';
+    ctx.fillText(series[series.length - 1].t, W - padding.right, H - 6);
+    ctx.textAlign = 'left';
+  }
+}
+
+function shortTime(ts) {
+  const d = new Date(ts.replace(' ', 'T'));
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+const ALARM_LABELS = {
+  temp_high: 'Temperature above limit',
+  temp_low: 'Temperature below limit',
+  rh_high: 'Humidity above limit',
+  rh_low: 'Humidity below limit',
+};
+
+async function refresh() {
+  const printer_id = printerSelect.value;
+  const hours = hoursSelect.value;
+  let data;
+  try {
+    const res = await fetch(`api_data.php?printer_id=${encodeURIComponent(printer_id)}&hours=${hours}`);
+    data = await res.json();
+  } catch (e) {
+    document.getElementById('last-update').textContent = 'Connection error — retrying…';
+    return;
+  }
+  if (data.error) {
+    document.getElementById('last-update').textContent = 'Error: ' + data.error;
+    return;
+  }
+
+  // populate printer list
+  if (data.printers && data.printers.length) {
+    const current = printerSelect.value;
+    printerSelect.innerHTML = data.printers.map(p => `<option value="${p}">${p}</option>`).join('');
+    if (data.printers.includes(current)) printerSelect.value = current;
+  }
+
+  const th = data.thresholds || {};
+  const latest = data.latest;
+
+  document.getElementById('last-update').textContent = latest
+    ? `Last reading: ${latest.ts} (${latest.source === 'simulated' ? 'SIMULATED DATA' : 'sensor'})`
+    : 'No readings yet';
+
+  const tempEl = document.getElementById('temp-value');
+  const rhEl = document.getElementById('rh-value');
+  const dpEl = document.getElementById('dp-value');
+
+  if (latest) {
+    tempEl.textContent = fmt(latest.temperature) + ' °C';
+    tempEl.className = 'value ' + statusClass(parseFloat(latest.temperature), th.temp_min, th.temp_max);
+    rhEl.textContent = fmt(latest.humidity) + ' %';
+    rhEl.className = 'value ' + statusClass(parseFloat(latest.humidity), th.rh_min, th.rh_max);
+    dpEl.textContent = fmt(latest.dew_point) + ' °C';
+  } else {
+    tempEl.textContent = '—'; rhEl.textContent = '—'; dpEl.textContent = '—';
+  }
+
+  document.getElementById('temp-range').textContent = `Limit: ${fmt(th.temp_min)}–${fmt(th.temp_max)} °C`;
+  document.getElementById('rh-range').textContent = `Limit: ${fmt(th.rh_min)}–${fmt(th.rh_max)} %`;
+
+  const pctEl = document.getElementById('pct-value');
+  pctEl.textContent = data.pct_time_outside_limits === null ? '—' : data.pct_time_outside_limits + '%';
+  pctEl.className = 'value ' + (data.pct_time_outside_limits > 5 ? 'status-bad'
+                     : data.pct_time_outside_limits > 0 ? 'status-warn' : 'status-ok');
+
+  const history = data.history || [];
+  const tempSeries = history.map(r => ({ v: parseFloat(r.temperature), t: shortTime(r.ts) }));
+  const rhSeries = history.map(r => ({ v: parseFloat(r.humidity), t: shortTime(r.ts) }));
+  drawChart(document.getElementById('temp-chart'), tempSeries, parseFloat(th.temp_min), parseFloat(th.temp_max), '°C');
+  drawChart(document.getElementById('rh-chart'), rhSeries, parseFloat(th.rh_min), parseFloat(th.rh_max), '%');
+
+  const alarmsContainer = document.getElementById('alarms-container');
+  const alarms = data.alarms || [];
+  if (alarms.length === 0) {
+    alarmsContainer.innerHTML = '<div class="empty">No alarms recorded</div>';
+  } else {
+    alarmsContainer.innerHTML = `
+      <table>
+        <thead><tr><th>Type</th><th>Start</th><th>End</th><th>Peak</th><th>Status</th></tr></thead>
+        <tbody>
+          ${alarms.map(a => `
+            <tr>
+              <td>${ALARM_LABELS[a.alarm_type] || a.alarm_type}</td>
+              <td>${a.start_ts}</td>
+              <td>${a.end_ts || '<em>ongoing</em>'}</td>
+              <td>${fmt(a.peak_value)}</td>
+              <td>${a.status === 'active' ? '<span class="badge bad">ACTIVE</span>' : '<span class="badge ok">cleared</span>'}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`;
+  }
+}
+
+printerSelect.addEventListener('change', refresh);
+hoursSelect.addEventListener('change', refresh);
+window.addEventListener('resize', refresh);
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+
+</body>
+</html>
