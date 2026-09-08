@@ -1,0 +1,57 @@
+<?php
+/**
+ * SYNTHETIC DEMO DATA GENERATOR — not real sensor data.
+ *
+ * Every row this script inserts is tagged source='simulated' in the
+ * database and shown as "SIMULATED DATA" on the dashboard. It exists
+ * only so the ingest/alarm/dashboard code can be exercised before a
+ * real sensor or the DMC-201 server feed is connected.
+ *
+ * Usage:
+ *   php simulate.php                  # one drifting run, posts every 2s
+ *   php simulate.php --excursion      # deliberately drifts out of range
+ *                                       to demonstrate alarm behavior
+ */
+require __DIR__ . '/config.php';
+require __DIR__ . '/functions.php';
+
+$printer_id = 'SMD-01';
+$temp = 25.0;
+$rh = 45.0;
+$force_excursion = in_array('--excursion', $argv, true);
+
+echo "Simulating readings for $printer_id. Ctrl+C to stop.\n";
+echo "All rows are tagged source='simulated'.\n\n";
+
+$tick = 0;
+while (true) {
+    $tick++;
+
+    // gentle random walk
+    $temp += (mt_rand(-20, 20) / 100);
+    $rh += (mt_rand(-30, 30) / 100);
+
+    // optionally force a sustained excursion after 10 ticks, to
+    // demonstrate the dwell-based alarm actually firing
+    if ($force_excursion && $tick > 10 && $tick < 40) {
+        $temp += 0.15; // drift upward past the high limit
+    }
+
+    $temp = max(15, min(40, $temp));
+    $rh = max(10, min(90, $rh));
+
+    $ts = date('Y-m-d H:i:s');
+    $dp = dew_point($temp, $rh);
+
+    $stmt = $pdo->prepare(
+        "INSERT INTO readings (printer_id, ts, temperature, humidity, dew_point, source)
+         VALUES (?, ?, ?, ?, ?, 'simulated')"
+    );
+    $stmt->execute([$printer_id, $ts, round($temp, 2), round($rh, 2), $dp]);
+
+    evaluate_alarms($pdo, $printer_id, $ts);
+
+    printf("[%s] T=%.2f°C RH=%.2f%% DP=%.2f°C\n", $ts, $temp, $rh, $dp);
+
+    sleep(2);
+}
