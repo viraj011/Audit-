@@ -1,0 +1,58 @@
+<?php
+/**
+ * POST endpoint. Accepts one reading and logs it.
+ *
+ * JSON body:
+ *   { "printer_id": "SMD-01", "temperature": 25.1, "humidity": 45.2 }
+ *
+ * Optional fields:
+ *   "ts"     - ISO/MySQL datetime string; defaults to server time now
+ *   "source" - "sensor" (default) or "simulated" — synthetic data must
+ *              always be tagged "simulated" so it can never be mistaken
+ *              for a real measurement downstream.
+ */
+require __DIR__ . '/config.php';
+require __DIR__ . '/functions.php';
+
+header('Content-Type: application/json');
+
+$raw = file_get_contents('php://input');
+$input = json_decode($raw, true);
+if (!is_array($input)) {
+    $input = $_POST; // allow form-encoded submissions too
+}
+
+$printer_id  = isset($input['printer_id']) ? trim((string)$input['printer_id']) : 'SMD-01';
+$temperature = isset($input['temperature']) ? (float)$input['temperature'] : null;
+$humidity    = isset($input['humidity']) ? (float)$input['humidity'] : null;
+$source      = in_array($input['source'] ?? 'sensor', ['sensor', 'simulated'], true)
+                ? $input['source'] : 'sensor';
+$ts          = $input['ts'] ?? date('Y-m-d H:i:s');
+
+if ($temperature === null || $humidity === null || $printer_id === '') {
+    http_response_code(400);
+    echo json_encode(['error' => 'printer_id, temperature and humidity are required']);
+    exit;
+}
+
+if ($humidity < 0 || $humidity > 100) {
+    http_response_code(400);
+    echo json_encode(['error' => 'humidity must be between 0 and 100']);
+    exit;
+}
+
+$dew_point = dew_point($temperature, $humidity);
+
+$stmt = $pdo->prepare(
+    "INSERT INTO readings (printer_id, ts, temperature, humidity, dew_point, source)
+     VALUES (?, ?, ?, ?, ?, ?)"
+);
+$stmt->execute([$printer_id, $ts, $temperature, $humidity, $dew_point, $source]);
+
+evaluate_alarms($pdo, $printer_id, $ts);
+
+echo json_encode([
+    'status' => 'ok',
+    'printer_id' => $printer_id,
+    'dew_point' => $dew_point,
+]);
